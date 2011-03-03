@@ -11,3 +11,5 @@ handlers:
 inbound_services:
 - xmpp_message
 
+builtins:
+- datastore_admin: on

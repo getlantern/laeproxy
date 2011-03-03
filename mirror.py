@@ -77,7 +77,7 @@ MIRROR_HOSTS = frozenset([
   'www3.mirrorrr.com',
 ])
 
-MAX_CONTENT_SIZE = 10000000
+MAX_CONTENT_SIZE = 32 * 1000 * 1000
 
 MAX_URL_DISPLAY_LENGTH = 100
 
@@ -145,18 +145,21 @@ class MirroredContent(object):
         adjusted_headers[adjusted_key] = value
 
     content = response.content
-    page_content_type = adjusted_headers.get("content-type", "")
-    for content_type in TRANSFORMED_CONTENT_TYPES:
+    
+    """
+    #page_content_type = adjusted_headers.get("content-type", "")
+    #for content_type in TRANSFORMED_CONTENT_TYPES:
       # Startswith() because there could be a 'charset=UTF-8' in the header.
-      if page_content_type.startswith(content_type):
-        content = transform_content.TransformContent(base_url, mirrored_url,
-                                                     content)
-        break
+    #  if page_content_type.startswith(content_type):
+    #    content = transform_content.TransformContent(base_url, mirrored_url,
+    #                                                 content)
+    #    break
+    """
 
-    # If the transformed content is over 1MB, truncate it (yikes!)
-    if len(content) > MAX_CONTENT_SIZE:
-      logging.warning('Content is over 1MB; truncating')
-      content = content[:MAX_CONTENT_SIZE]
+    # If the transformed content is over the maximum, truncate it (yikes!)
+    #if len(content) > MAX_CONTENT_SIZE:
+    #  logging.warning('Content is over maximum size; truncating. Size is: %s', len(content))
+    #  content = content[:MAX_CONTENT_SIZE]
 
     new_content = MirroredContent(
       base_url=base_url,
@@ -165,6 +168,7 @@ class MirroredContent(object):
       status=response.status_code,
       headers=adjusted_headers,
       data=content)
+    
     if not memcache.add(key_name, new_content, time=EXPIRATION_DELTA_SECONDS):
       logging.error('memcache.add failed: key_name = "%s", '
                     'original_url = "%s"', key_name, mirrored_url)
