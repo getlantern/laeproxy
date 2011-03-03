@@ -77,9 +77,9 @@ MIRROR_HOSTS = frozenset([
   'www3.mirrorrr.com',
 ])
 
-MAX_CONTENT_SIZE = 10 ** 6
+MAX_CONTENT_SIZE = 3000000
 
-MAX_URL_DISPLAY_LENGTH = 50
+MAX_URL_DISPLAY_LENGTH = 100
 
 ################################################################################
 
