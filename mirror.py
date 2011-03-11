@@ -26,7 +26,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from urllib import splittype, splithost
+from urllib import splittype, splithost, unquote
 from wsgiref.handlers import CGIHandler
 
 from google.appengine.api import urlfetch
@@ -66,6 +66,9 @@ RESPONSE_TOO_LARGE = 'Response too large'
 IGNORE_HEADERS_REQ = frozenset((
     'content-length',
     'host',
+    'vary',
+    'via',
+    'x-forwarded-for',
     ))
 
 IGNORE_HEADERS_RES = frozenset((
@@ -91,9 +94,11 @@ class MirrorHandler(webapp.RequestHandler):
             afternetloc = splithost(splittype(req.url)[1])[1][1:]
             try:
                 scheme, rest = afternetloc.split('/', 1)
+                host, rest = rest.split('/', 1)
             except ValueError:
                 return self.error(404)
-            url = scheme + '://' + rest
+            host = unquote(host)
+            url = scheme + '://' + host + '/' + rest
             payload = req.body if method in PAYLOAD_METHODS else None
             headers = dict((k, v) for (k, v) in req.headers.iteritems()
                 if k.lower() not in IGNORE_HEADERS_REQ)
