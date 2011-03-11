@@ -120,7 +120,7 @@ class MirrorHandler(webapp.RequestHandler):
             # XXX check for EIGEN_HEADER_KEY to avoid potential loops?
             #if fetched.headers.get(EIGEN_HEADER_KEY) is not None:
             #    return
-            res.status = fetched.status_code
+            res.set_status(fetched.status_code)
             for k, v in fetched.headers.iteritems():
                 if k.lower() not in IGNORE_HEADERS_RES:
                     res.headers[k] = v
