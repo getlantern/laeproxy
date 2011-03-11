@@ -1,4 +1,17 @@
 #!/usr/bin/env python
+
+# Lantern App Engine Proxy
+#
+# Based on <http://code.google.com/p/mirrorrr> by Brett Slatkin
+# <bslatkin@gmail.com> (see original copyright notice below)
+#
+# Modified for use with Lantern <http://www.getlantern.org> by
+# Brave New Software <http://www.bravenewsoftware.org>
+#
+# Any copyrightable modifications by Brave New Software are copyright 2011
+# Brave New Software and are hereby redistributed under the terms of the
+# license of the original work, which follows:
+#
 # Copyright 2008 Brett Slatkin
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,285 +26,123 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__author__ = "Brett Slatkin (bslatkin@gmail.com)"
+from urllib import splittype, splithost, unquote
+from wsgiref.handlers import CGIHandler
 
-import datetime
-import hashlib
-import logging
-import pickle
-import re
-import time
-import urllib
-import wsgiref.handlers
-
-from google.appengine.api import memcache
 from google.appengine.api import urlfetch
-from google.appengine.ext import db
 from google.appengine.ext import webapp
-from google.appengine.ext.webapp import template
-from google.appengine.runtime import apiproxy_errors
 
-import transform_content
-
-################################################################################
-
-DEBUG = False
-EXPIRATION_DELTA_SECONDS = 3600
-EXPIRATION_RECENT_URLS_SECONDS = 90
-
-## DEBUG = True
-## EXPIRATION_DELTA_SECONDS = 10
-## EXPIRATION_RECENT_URLS_SECONDS = 1
-
-HTTP_PREFIX = "http://"
-HTTPS_PREFIX = "http://"
-
-IGNORE_HEADERS = frozenset([
-  'set-cookie',
-  'expires',
-  'cache-control',
-
-  # Ignore hop-by-hop headers
-  'connection',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailers',
-  'transfer-encoding',
-  'upgrade',
-])
-
-TRANSFORMED_CONTENT_TYPES = frozenset([
-  "text/html",
-  "text/css",
-])
-
-MIRROR_HOSTS = frozenset([
-  'mirrorr.com',
-  'mirrorrr.com',
-  'www.mirrorr.com',
-  'www.mirrorrr.com',
-  'www1.mirrorrr.com',
-  'www2.mirrorrr.com',
-  'www3.mirrorrr.com',
-])
-
-MAX_CONTENT_SIZE = 32 * 1000 * 1000
-
-MAX_URL_DISPLAY_LENGTH = 100
-
-################################################################################
-
-def get_url_key_name(url):
-  url_hash = hashlib.sha256()
-  url_hash.update(url)
-  return "hash_" + url_hash.hexdigest()
-
-################################################################################
-
-class EntryPoint(db.Model):
-  translated_address = db.TextProperty(required=True)
-  last_updated = db.DateTimeProperty(auto_now=True)
-  display_address = db.TextProperty()
+import logging
 
 
-class MirroredContent(object):
-  def __init__(self, original_address, translated_address,
-               status, headers, data, base_url):
-    self.original_address = original_address
-    self.translated_address = translated_address
-    self.status = status
-    self.headers = headers
-    self.data = data
-    self.base_url = base_url
+## DEBUG = False
+## EXPIRATION_DELTA_SECONDS = 60
 
-  @staticmethod
-  def get_by_key_name(key_name):
-    return memcache.get(key_name)
+DEBUG = True
+EXPIRATION_DELTA_SECONDS = 1
+logging.getLogger().setLevel(logging.DEBUG)
 
-  @staticmethod
-  def fetch_and_store(key_name, base_url, translated_address, mirrored_url):
-    """Fetch and cache a page.
-    
-    Args:
-      key_name: Hash to use to store the cached page.
-      base_url: The hostname of the page that's being mirrored.
-      translated_address: The URL of the mirrored page on this site.
-      mirrored_url: The URL of the original page. Hostname should match
-        the base_url.
-    
-    Returns:
-      A new MirroredContent object, if the page was successfully retrieved.
-      None if any errors occurred or the content could not be retrieved.
-    """
-    # Check for the X-Mirrorrr header to ignore potential loops.
-    if base_url in MIRROR_HOSTS:
-      logging.warning('Encountered recursive request for "%s"; ignoring',
-                      mirrored_url)
-      return None
+def breakpoint():
+    import sys, pdb
+    for attr in ('stdin', 'stdout', 'stderr'):
+        setattr(sys, attr, getattr(sys, '__%s__' % attr))
+    pdb.set_trace()
 
-    logging.debug("Fetching '%s'", mirrored_url)
-    try:
-      response = urlfetch.fetch(mirrored_url)
-    except (urlfetch.Error, apiproxy_errors.Error):
-      logging.exception("Could not fetch URL")
-      return None
+DELETE = 'delete'
+GET = 'get'
+HEAD = 'head'
+PUT = 'put'
+POST = 'post'
+METHODS = frozenset((DELETE, GET, HEAD, PUT, POST))
+PAYLOAD_METHODS = frozenset((PUT, POST))
 
-    adjusted_headers = {}
-    for key, value in response.headers.iteritems():
-      adjusted_key = key.lower()
-      if adjusted_key not in IGNORE_HEADERS:
-        adjusted_headers[adjusted_key] = value
+# this header is added to content we serve
+EIGEN_HEADER_KEY = 'X-Mirrorrr'
+# various values corresponding to possible results of proxy requests
+RETRIEVED_FROM_NET = 'Retrieved from network'
+RETRIEVED_FROM_CACHE = 'Retrieved from cache'
+RESPONSE_TOO_LARGE = 'Response too large'
 
-    content = response.content
-    
-    """
-    #page_content_type = adjusted_headers.get("content-type", "")
-    #for content_type in TRANSFORMED_CONTENT_TYPES:
-      # Startswith() because there could be a 'charset=UTF-8' in the header.
-    #  if page_content_type.startswith(content_type):
-    #    content = transform_content.TransformContent(base_url, mirrored_url,
-    #                                                 content)
-    #    break
-    """
+IGNORE_HEADERS_REQ = frozenset((
+    'content-length',
+    'host',
+    'vary',
+    'via',
+    'x-forwarded-for',
+    ))
 
-    # If the transformed content is over the maximum, truncate it (yikes!)
-    #if len(content) > MAX_CONTENT_SIZE:
-    #  logging.warning('Content is over maximum size; truncating. Size is: %s', len(content))
-    #  content = content[:MAX_CONTENT_SIZE]
+IGNORE_HEADERS_RES = frozenset((
+    # Ignore hop-by-hop headers
+    # http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailers',
+    'transfer-encoding',
+    'upgrade',
+    ))
 
-    new_content = MirroredContent(
-      base_url=base_url,
-      original_address=mirrored_url,
-      translated_address=translated_address,
-      status=response.status_code,
-      headers=adjusted_headers,
-      data=content)
-    
-    if not memcache.add(key_name, new_content, time=EXPIRATION_DELTA_SECONDS):
-      logging.error('memcache.add failed: key_name = "%s", '
-                    'original_url = "%s"', key_name, mirrored_url)
-      
-    return new_content
+class MirrorHandler(webapp.RequestHandler):
 
-################################################################################
+    def make_handler(method):
+        assert method in METHODS, 'unsupported method: %s' % method
+        def handler(self, *args, **kw):
+            req = self.request
+            res = self.response
+            afternetloc = splithost(splittype(req.url)[1])[1][1:]
+            try:
+                scheme, rest = afternetloc.split('/', 1)
+                host, rest = rest.split('/', 1)
+            except ValueError:
+                return self.error(404)
+            host = unquote(host)
+            url = scheme + '://' + host + '/' + rest
+            payload = req.body if method in PAYLOAD_METHODS else None
+            headers = dict((k, v) for (k, v) in req.headers.iteritems()
+                if k.lower() not in IGNORE_HEADERS_REQ)
+            try:
+                # XXX http://code.google.com/appengine/docs/python/urlfetch/fetchfunction.html
+                fetched = urlfetch.fetch(url,
+                    payload=payload,
+                    method=method,
+                    headers=headers,
+                    allow_truncated=False,
+                    follow_redirects=False,
+                    deadline=10,
+                    validate_certificate=True,
+                    )
+            except urlfetch.InvalidURLError, e:
+                return self.error(404)
+            except urlfetch.ResponseTooLargeError:
+                res.headers[EIGEN_HEADER_KEY] = RESPONSE_TOO_LARGE
+                return self.error(400) # XXX
+            except Exception, e:
+                logging.error('urlfetch(url=%s) => %s' % (url, e))
+                res.headers[EIGEN_HEADER_KEY] = str(e)
+                raise
+            # XXX check for EIGEN_HEADER_KEY to avoid potential loops?
+            #if fetched.headers.get(EIGEN_HEADER_KEY) is not None:
+            #    return
+            res.set_status(fetched.status_code)
+            for k, v in fetched.headers.iteritems():
+                if k.lower() not in IGNORE_HEADERS_RES:
+                    res.headers[k] = v
+            res.headers[EIGEN_HEADER_KEY] = RETRIEVED_FROM_NET
+            res.out.write(fetched.content) # XXX just return resp?
+        handler.func_name = method
+        return handler
 
-class BaseHandler(webapp.RequestHandler):
-  def get_relative_url(self):
-    slash = self.request.url.find("/", len(self.request.scheme + "://"))
-    if slash == -1:
-      return "/"
-    return self.request.url[slash:]
+    for method in METHODS:
+        locals()[method] = make_handler(method)
 
-
-class HomeHandler(BaseHandler):
-  def get(self):
-    # Handle the input form to redirect the user to a relative url
-    form_url = self.request.get("url")
-    if form_url:
-      # Accept URLs that still have a leading 'http://'
-      inputted_url = urllib.unquote(form_url)
-      if inputted_url.startswith(HTTP_PREFIX):
-        inputted_url = inputted_url[len(HTTP_PREFIX):]
-      return self.redirect("/" + inputted_url)
-
-    latest_urls = memcache.get('latest_urls')
-    if latest_urls is None:
-      latest_urls = EntryPoint.gql("ORDER BY last_updated DESC").fetch(25)
-
-      # Generate a display address that truncates the URL, adds an ellipsis.
-      # This is never actually saved in the Datastore.
-      for entry_point in latest_urls:
-        entry_point.display_address = \
-          entry_point.translated_address[:MAX_URL_DISPLAY_LENGTH]
-        if len(entry_point.display_address) == MAX_URL_DISPLAY_LENGTH:
-          entry_point.display_address += '...'
-
-      if not memcache.add('latest_urls', latest_urls,
-                          time=EXPIRATION_RECENT_URLS_SECONDS):
-        logging.error('memcache.add failed: latest_urls')
-
-    # Do this dictionary construction here, to decouple presentation from
-    # how we store data.
-    secure_url = None
-    if self.request.scheme == "http":
-      secure_url = "https://mirrorrr.appspot.com"
-    context = {
-      "latest_urls": latest_urls,
-      "secure_url": secure_url,
-    }
-    self.response.out.write(template.render("main.html", context))
-
-
-class MirrorHandler(BaseHandler):
-  def get(self, base_url):
-    assert base_url
-    
-    # Log the user-agent and referrer, to see who is linking to us.
-    logging.debug('User-Agent = "%s", Referrer = "%s"',
-                  self.request.user_agent,
-                  self.request.referer)
-    logging.debug('Base_url = "%s", url = "%s"', base_url, self.request.url)
-
-    translated_address = self.get_relative_url()[1:]  # remove leading /
-    mirrored_url = HTTP_PREFIX + translated_address
-
-    # Use sha256 hash instead of mirrored url for the key name, since key
-    # names can only be 500 bytes in length; URLs may be up to 2KB.
-    key_name = get_url_key_name(mirrored_url)
-    logging.info("Handling request for '%s' = '%s'", mirrored_url, key_name)
-
-    content = MirroredContent.get_by_key_name(key_name)
-    cache_miss = False
-    if content is None:
-      logging.debug("Cache miss")
-      cache_miss = True
-      content = MirroredContent.fetch_and_store(key_name, base_url,
-                                                translated_address,
-                                                mirrored_url)
-    if content is None:
-      return self.error(404)
-
-    # Store the entry point down here, once we know the request is good and
-    # there has been a cache miss (i.e., the page expired). If the referrer
-    # wasn't local, or it was '/', then this is an entry point.
-    if (cache_miss and
-        'Googlebot' not in self.request.user_agent and
-        'Slurp' not in self.request.user_agent and
-        (not self.request.referer.startswith(self.request.host_url) or
-         self.request.referer == self.request.host_url + "/")):
-      # Ignore favicons as entry points; they're a common browser fetch on
-      # every request for a new site that we need to special case them here.
-      if not self.request.url.endswith("favicon.ico"):
-        logging.info("Inserting new entry point")
-        entry_point = EntryPoint(
-          key_name=key_name,
-          translated_address=translated_address)
-        try:
-          entry_point.put()
-        except (db.Error, apiproxy_errors.Error):
-          logging.exception("Could not insert EntryPoint")
-    
-    for key, value in content.headers.iteritems():
-      self.response.headers[key] = value
-    if not DEBUG:
-      self.response.headers['cache-control'] = \
-        'max-age=%d' % EXPIRATION_DELTA_SECONDS
-
-    self.response.out.write(content.data)
-
-
-app = webapp.WSGIApplication([
-  (r"/", HomeHandler),
-  (r"/main", HomeHandler),
-  (r"/([^/]+).*", MirrorHandler)
-], debug=DEBUG)
-
+app = webapp.WSGIApplication((
+    (r'/([^/]+).*', MirrorHandler),
+    ), debug=DEBUG)
 
 def main():
-  wsgiref.handlers.CGIHandler().run(app)
-
+    CGIHandler().run(app)
 
 if __name__ == "__main__":
-  main()
+    main()
