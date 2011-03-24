@@ -102,6 +102,11 @@ class MirrorHandler(webapp.RequestHandler):
             payload = req.body if method in PAYLOAD_METHODS else None
             headers = dict((k, v) for (k, v) in req.headers.iteritems()
                 if k.lower() not in IGNORE_HEADERS_REQ)
+            # http://code.google.com/p/googleappengine/issues/detail?id=739
+            headers.update({
+                'Cache-Control': 'no-cache,max-age=0',
+                'Pragma': 'no-cache',
+                }
             try:
                 # XXX http://code.google.com/appengine/docs/python/urlfetch/fetchfunction.html
                 fetched = urlfetch.fetch(url,
