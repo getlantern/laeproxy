@@ -30,11 +30,9 @@ from datetime import datetime
 from os import environ
 from traceback import format_exc
 from urllib import unquote
-from wsgiref.handlers import CGIHandler
 
 from google.appengine.api import urlfetch
 from google.appengine.ext import webapp
-from google.appengine.ext.webapp.util import run_wsgi_app
 
 import logging
 
@@ -143,7 +141,7 @@ class MirrorHandler(webapp.RequestHandler):
             except Exception, e:
                 logging.error('urlfetch(url=%s) => %s' % (url, e))
                 if DEBUG: logging.debug(format_exc())
-                res.headers[EIGEN_HEADER_KEY] = UNEXPECTED_ERROR % e
+                resheaders[EIGEN_HEADER_KEY] = UNEXPECTED_ERROR % e
                 return self.error(500)
             res.set_status(fetched.status_code)
             for k, v in fetched.headers.iteritems():
@@ -163,8 +161,10 @@ app = webapp.WSGIApplication((
 
 def main():
     if DEBUG:
+        from wsgiref.handlers import CGIHandler
         CGIHandler().run(app)
     else:
+        from google.appengine.ext.webapp.util import run_wsgi_app
         run_wsgi_app(app)
 
 if __name__ == "__main__":
