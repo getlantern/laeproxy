@@ -26,27 +26,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from urllib import splittype, splithost, unquote
+from datetime import datetime
+from os import environ
+from traceback import format_exc
+from urllib import unquote
 from wsgiref.handlers import CGIHandler
 
 from google.appengine.api import urlfetch
 from google.appengine.ext import webapp
+from google.appengine.ext.webapp.util import run_wsgi_app
 
 import logging
 
+now = datetime.utcnow
 
-## DEBUG = False
-## EXPIRATION_DELTA_SECONDS = 60
+DEBUG = environ.get('SERVER_SOFTWARE', '').startswith('Dev')
+if DEBUG:
+    logging.getLogger().setLevel(logging.DEBUG)
 
-DEBUG = True
-EXPIRATION_DELTA_SECONDS = 1
-logging.getLogger().setLevel(logging.DEBUG)
-
-def breakpoint():
+def _breakpoint():
+    if not DEBUG: return
     import sys, pdb
-    for attr in ('stdin', 'stdout', 'stderr'):
-        setattr(sys, attr, getattr(sys, '__%s__' % attr))
+    def swap():
+        for i in ('stdin', 'stdout', 'stderr'):
+            i_ = '__%s__' % i
+            tmp = getattr(sys, i)
+            setattr(sys, i, getattr(sys, i_))
+            setattr(sys, i_, tmp)
+    swap()
     pdb.set_trace()
+    swap()
 
 DELETE = 'delete'
 GET = 'get'
@@ -59,9 +68,11 @@ PAYLOAD_METHODS = frozenset((PUT, POST))
 # this header is added to content we serve
 EIGEN_HEADER_KEY = 'X-Mirrorrr'
 # various values corresponding to possible results of proxy requests
-RETRIEVED_FROM_NET = 'Retrieved from network'
+RETRIEVED_FROM_NET = 'Retrieved from network %s'
 RETRIEVED_FROM_CACHE = 'Retrieved from cache'
+IGNORED_RECURSIVE = 'Ignored recursive request'
 RESPONSE_TOO_LARGE = 'Response too large'
+UNEXPECTED_ERROR = 'Unexpected error: %s'
 
 IGNORE_HEADERS_REQ = frozenset((
     'content-length',
@@ -91,22 +102,28 @@ class MirrorHandler(webapp.RequestHandler):
         def handler(self, *args, **kw):
             req = self.request
             res = self.response
-            afternetloc = splithost(splittype(req.url)[1])[1][1:]
+            resheaders = res.headers
+            logging.debug('req.url: %s' % req.url)
+            path = req.path_qs.lstrip('/')
             try:
-                scheme, rest = afternetloc.split('/', 1)
-                host, rest = rest.split('/', 1)
+                scheme, rest = path.split('/', 1)
+                split = rest.split('/', 1)
+                host = split[0]
+                rest = split[1] if len(split) > 1 else ''
             except ValueError:
                 return self.error(404)
             host = unquote(host)
+            if req.host == host:
+                logging.info('Ignoring recursive request %s' % req.url)
+                resheaders[EIGEN_HEADER_KEY] = IGNORED_RECURSIVE
+                return
             url = scheme + '://' + host + '/' + rest
             payload = req.body if method in PAYLOAD_METHODS else None
-            headers = dict((k, v) for (k, v) in req.headers.iteritems()
-                if k.lower() not in IGNORE_HEADERS_REQ)
+            headers = req.headers
+            for i in IGNORE_HEADERS_REQ:
+                headers.pop(i, None)
             # http://code.google.com/p/googleappengine/issues/detail?id=739
-            headers.update({
-                'Cache-Control': 'no-cache,max-age=0',
-                'Pragma': 'no-cache',
-                }
+            headers.update(cache_control='no-cache,max-age=0', pragma='no-cache')
             try:
                 # XXX http://code.google.com/appengine/docs/python/urlfetch/fetchfunction.html
                 fetched = urlfetch.fetch(url,
@@ -121,21 +138,19 @@ class MirrorHandler(webapp.RequestHandler):
             except urlfetch.InvalidURLError, e:
                 return self.error(404)
             except urlfetch.ResponseTooLargeError:
-                res.headers[EIGEN_HEADER_KEY] = RESPONSE_TOO_LARGE
+                resheaders[EIGEN_HEADER_KEY] = RESPONSE_TOO_LARGE
                 return self.error(400) # XXX
             except Exception, e:
                 logging.error('urlfetch(url=%s) => %s' % (url, e))
-                res.headers[EIGEN_HEADER_KEY] = str(e)
-                raise
-            # XXX check for EIGEN_HEADER_KEY to avoid potential loops?
-            #if fetched.headers.get(EIGEN_HEADER_KEY) is not None:
-            #    return
+                if DEBUG: logging.debug(format_exc())
+                res.headers[EIGEN_HEADER_KEY] = UNEXPECTED_ERROR % e
+                return self.error(500)
             res.set_status(fetched.status_code)
             for k, v in fetched.headers.iteritems():
                 if k.lower() not in IGNORE_HEADERS_RES:
-                    res.headers[k] = v
-            res.headers[EIGEN_HEADER_KEY] = RETRIEVED_FROM_NET
-            res.out.write(fetched.content) # XXX just return resp?
+                    resheaders[k] = v
+            resheaders[EIGEN_HEADER_KEY] = RETRIEVED_FROM_NET % now()
+            res.out.write(fetched.content)
         handler.func_name = method
         return handler
 
@@ -147,7 +162,10 @@ app = webapp.WSGIApplication((
     ), debug=DEBUG)
 
 def main():
-    CGIHandler().run(app)
+    if DEBUG:
+        CGIHandler().run(app)
+    else:
+        run_wsgi_app(app)
 
 if __name__ == "__main__":
     main()
