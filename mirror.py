@@ -114,7 +114,7 @@ class MirrorHandler(webapp.RequestHandler):
             if req.host == host:
                 logging.info('Ignoring recursive request %s' % req.url)
                 resheaders[EIGEN_HEADER_KEY] = IGNORED_RECURSIVE
-                return
+                return self.error(404)
             url = scheme + '://' + host + '/' + rest
             payload = req.body if method in PAYLOAD_METHODS else None
             headers = req.headers
