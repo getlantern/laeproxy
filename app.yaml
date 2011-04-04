@@ -6,7 +6,7 @@ api_version: 1
 handlers:
 - url: /.*
   script: mirror.py
-  secure: optional
+  secure: always
 
 inbound_services:
 - xmpp_message
