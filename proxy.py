@@ -68,7 +68,7 @@ PAYLOAD_METHODS = frozenset((PUT, POST))
 URLFETCH_REQ_MAXBYTES = 1024 * 1024 # 1MB
 URLFETCH_RES_MAXBYTES = 1024 * 1024 * 32
 # http://code.google.com/appengine/docs/python/urlfetch/fetchfunction.html
-URLFETCH_REQ_MAXSECS = 10 # seconds
+URLFETCH_REQ_MAXSECS = 10
 # http://code.google.com/appengine/docs/python/runtime.html#Quotas_and_Limits
 GAE_REQ_MAXBYTES = 1024 * 1024 * 10
 GAE_RES_MAXBYTES = 1024 * 1024 * 10
@@ -76,16 +76,18 @@ GAE_REQ_MAXSECS = 30
 
 RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 32 # wiggle room?
 
+_RANGE_REQ_SUFFIX = '. Range requested: bytes=%d-%d'
+
 # stamp our responses with this header
 EIGEN_HEADER_KEY = 'X-laeproxy'
 # various values corresponding to possible results of proxy requests
 RETRIEVED_FROM_NET = 'Retrieved from network %s'
 RETRIEVED_FROM_CACHE = 'Retrieved from cache'
 IGNORED_RECURSIVE = 'Ignored recursive request'
-REQUEST_TOO_LARGE = 'Request size exceeds urlfetch limit'
-RESPONSE_TOO_LARGE = 'Response too large'
-URLFETCH_DEADLINE_EXCEEDED = 'Response exceeded urlfetch deadline'
-GAE_DEADLINE_EXCEEDED = 'Response exceeded GAE deadline'
+REQ_TOO_LARGE = 'Request size exceeds urlfetch limit'
+RES_TOO_LARGE = 'Response too large' + _RANGE_REQ_SUFFIX
+MISSED_DEADLINE_URLFETCH = 'Missed urlfetch deadline' + _RANGE_REQ_SUFFIX
+MISSED_DEADLINE_GAE = 'Missed GAE deadline'
 UNEXPECTED_ERROR = 'Unexpected error: %s'
 
 IGNORE_HEADERS_REQ = frozenset((
@@ -130,8 +132,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                 rest = parts[1]
             except IndexError:
                 rest = ''
-            host = parts[0]
-            host = unquote(host)
+            host = unquote(parts[0])
             if not host:
                 return self.error(404)
             if req.host == host:
@@ -143,7 +144,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             # check payload
             payload = req.body if method in PAYLOAD_METHODS else None
             if payload and len(payload) >= URLFETCH_REQ_MAXBYTES:
-                resheaders[EIGEN_HEADER_KEY] = REQUEST_TOO_LARGE
+                resheaders[EIGEN_HEADER_KEY] = REQ_TOO_LARGE
                 return self.error(413)
 
             # check headers
@@ -152,11 +153,11 @@ class LaeproxyHandler(webapp.RequestHandler):
                 reqheaders.pop(i, None)
 
             # always make range requests to avoid urlfetch.ResponseTooLargeError
-            rangeadded = False
-            if 'range' not in reqheaders:
-                reqheaders['range'] = 'bytes=0-%d' % RANGE_REQ_SIZE
-                rangeadded = True
-            else:
+            start = 0
+            end = RANGE_REQ_SIZE
+            rangeadded = True
+            if 'range' in reqheaders:
+                rangeadded = False
                 # check that range is within limits
                 try:
                     start, end = [int(i) for i in
@@ -165,12 +166,13 @@ class LaeproxyHandler(webapp.RequestHandler):
                         newend = start + RANGE_REQ_SIZE - 1
                         logging.info('Requested range (%d-%d) too large, '
                             'shortening to %d-%d' % (start, end, start, newend))
-                        reqheaders['range'] = 'bytes=%d-%d' % (start, newend)
+                        end = newend
                 except:
                     logging.debug('Error checking range: %s' % format_exc())
+            reqheaders['range'] = 'bytes=%d-%d' % (start, end)
 
             # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
-            # headers.update(cache_control='no-cache,max-age=0', pragma='no-cache')
+            # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
 
             try:
                 fetched = urlfetch.fetch(url,
@@ -186,13 +188,12 @@ class LaeproxyHandler(webapp.RequestHandler):
             except urlfetch.InvalidURLError:
                 return self.error(404)
             except urlfetch.DownloadError:
-                resheaders[EIGEN_HEADER_KEY] = URLFETCH_DEADLINE_EXCEEDED
+                resheaders[EIGEN_HEADER_KEY] = MISSED_DEADLINE_URLFETCH % (start, end)
                 return self.error(504)
             except urlfetch.ResponseTooLargeError:
-                logging.error('Maximum urlfetch response size exceeded. Limit '
-                    'lowered below %d bytes?' % RANGE_REQ_SIZE)
-                resheaders[EIGEN_HEADER_KEY] = RESPONSE_TOO_LARGE
-                return self.error(500)
+                # upstream server doesn't support range requests?
+                resheaders[EIGEN_HEADER_KEY] = RES_TOO_LARGE % (start, end)
+                return self.error(503)
             except Exception, e:
                 logging.error('Unexpected error: %s' % e)
                 logging.debug(format_exc())
@@ -211,9 +212,8 @@ class LaeproxyHandler(webapp.RequestHandler):
                     total = int(total)
                     if start == 0 and end == total - 1:
                         logging.debug('Retrieved entire entity, changing 206 to 200')
-                        status = 200
-                    # XXX necessary to strip content-range header?
-                    # probably ignored if status is 200?
+                        res.set_status(200)
+                    # XXX necessary to strip content-range header?  probably ignored if status is 200.
                 except:
                     logging.debug('Error checking content-range: %s' % format_exc())
 
@@ -232,10 +232,8 @@ class LaeproxyHandler(webapp.RequestHandler):
                 return handler(self, *args, **kw)
             except DeadlineExceededError:
                 res = self.response
-                res.clear()
-                res.set_status(500)
-                res.headers[EIGEN_HEADER_KEY] = GAE_DEADLINE_EXCEEDED
-                res.out.write('Operation could not be completed in time.')
+                res.set_status(503)
+                res.headers[EIGEN_HEADER_KEY] = MISSED_DEADLINE_GAE
         wrapper.func_name = handler.func_name
         return wrapper
                 
