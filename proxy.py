@@ -74,7 +74,8 @@ GAE_REQ_MAXBYTES = 1024 * 1024 * 10
 GAE_RES_MAXBYTES = 1024 * 1024 * 10
 GAE_REQ_MAXSECS = 30
 
-RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 32 # wiggle room?
+# RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 32 # wiggle room?
+RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
 
 _RANGE_REQ_SUFFIX = '. Range requested: bytes=%d-%d'
 
