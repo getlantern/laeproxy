@@ -1,15 +1,9 @@
-application: freelantern 
-version: 1
+application: laeproxy
+version: dev
 runtime: python
 api_version: 1
 
 handlers:
-- url: /.*
-  script: mirror.py
+- url: /http(s)?/.*
+  script: proxy.py
   secure: always
-
-inbound_services:
-- xmpp_message
-
-builtins:
-- datastore_admin: on
