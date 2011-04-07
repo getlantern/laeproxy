@@ -39,7 +39,8 @@ import logging
 
 now = datetime.utcnow
 
-DEBUG = environ.get('SERVER_SOFTWARE', '').startswith('Dev')
+#DEBUG = environ.get('SERVER_SOFTWARE', '').startswith('Dev')
+DEBUG = True
 if DEBUG:
     logging.getLogger().setLevel(logging.DEBUG)
 
@@ -74,7 +75,6 @@ GAE_REQ_MAXBYTES = 1024 * 1024 * 10
 GAE_RES_MAXBYTES = 1024 * 1024 * 10
 GAE_REQ_MAXSECS = 30
 
-# RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 32 # wiggle room?
 RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
 
 _RANGE_REQ_SUFFIX = '. Range requested: bytes=%d-%d'
@@ -214,7 +214,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                     if start == 0 and end == total - 1:
                         logging.debug('Retrieved entire entity, changing 206 to 200')
                         res.set_status(200)
-                    # XXX necessary to strip content-range header?  probably ignored if status is 200.
+                        del fetched.headers['content-range']
                 except:
                     logging.debug('Error checking content-range: %s' % format_exc())
 
@@ -222,7 +222,16 @@ class LaeproxyHandler(webapp.RequestHandler):
                 if k.lower() not in IGNORE_HEADERS_RES:
                     resheaders[k] = v
 
-            res.out.write(fetched.content)
+            # XXX handle exceeding response limit by truncating?
+            content_length = len(fetched.content)
+            if content_length >= RANGE_REQ_SIZE:
+                logging.info('Remote host returned %d bytes but %d were '
+                    'requested. (Doesn\'t support range requests? Status '
+                    'code was %d.)\nBody will be truncated!' %
+                    (content_length, RANGE_REQ_SIZE, status))
+                resheaders[EIGEN_HEADER_KEY] = 'Truncated! ' + resheaders[EIGEN_HEADER_KEY]
+
+            res.out.write(fetched.content[:RANGE_REQ_SIZE])
 
         handler.func_name = method
         return handler
