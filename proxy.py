@@ -159,17 +159,19 @@ class LaeproxyHandler(webapp.RequestHandler):
             rangeadded = True
             if 'range' in reqheaders:
                 rangeadded = False
+                range_ = reqheaders['range']
                 # check that range is within limits
                 try:
                     start, end = [int(i) for i in
-                        reqheaders['range'].lstrip('bytes=').split('-', 1)]
+                        range_.lstrip('bytes=').split('-', 1)]
+                except:
+                    logging.debug('Error parsing range "%s": %s' % (range_, format_exc()))
+                else:
                     if end - start >= RANGE_REQ_SIZE:
                         newend = start + RANGE_REQ_SIZE - 1
                         logging.info('Requested range (%d-%d) too large, '
                             'shortening to %d-%d' % (start, end, start, newend))
                         end = newend
-                except:
-                    logging.debug('Error checking range: %s' % format_exc())
             reqheaders['range'] = 'bytes=%d-%d' % (start, end)
 
             # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
@@ -207,16 +209,17 @@ class LaeproxyHandler(webapp.RequestHandler):
             # change to 200 if we changed to range request and got entire entity
             if rangeadded and status == 206:
                 try:
-                    sent, total = fetched.headers[
-                        'content-range'].lstrip('bytes ').split('/', 1)
+                    crange = fetched.headers.get('content-range', '')
+                    sent, total = crange.lstrip('bytes ').split('/', 1)
                     start, end = [int(i) for i in sent.split('-', 1)]
                     total = int(total)
+                except:
+                    logging.debug('Error parsing content-range "%s": %s' % (crange, format_exc()))
+                else:
                     if start == 0 and end == total - 1:
                         logging.debug('Retrieved entire entity, changing 206 to 200')
                         res.set_status(200)
                         del fetched.headers['content-range']
-                except:
-                    logging.debug('Error checking content-range: %s' % format_exc())
 
             for k, v in fetched.headers.iteritems():
                 if k.lower() not in IGNORE_HEADERS_RES:
