@@ -173,6 +173,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                             'shortening to %d-%d' % (start, end, start, newend))
                         end = newend
             reqheaders['range'] = 'bytes=%d-%d' % (start, end)
+            nbytesrequested = end - start + 1 # endpoints are inclusive
 
             # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
             # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
@@ -227,14 +228,14 @@ class LaeproxyHandler(webapp.RequestHandler):
 
             # XXX handle exceeding response limit by truncating?
             content_length = len(fetched.content)
-            if content_length >= RANGE_REQ_SIZE:
+            if content_length > nbytesrequested:
                 logging.info('Remote host returned %d bytes but %d were '
                     'requested. (Doesn\'t support range requests? Status '
                     'code was %d.)\nBody will be truncated!' %
-                    (content_length, RANGE_REQ_SIZE, status))
+                    (content_length, nbytesrequested, status))
                 resheaders[EIGEN_HEADER_KEY] = 'Truncated! ' + resheaders[EIGEN_HEADER_KEY]
 
-            res.out.write(fetched.content[:RANGE_REQ_SIZE])
+            res.out.write(fetched.content[:nbytesrequested])
 
         handler.func_name = method
         return handler
