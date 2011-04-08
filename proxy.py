@@ -157,9 +157,9 @@ class LaeproxyHandler(webapp.RequestHandler):
             start = 0
             end = RANGE_REQ_SIZE
             rangeadded = True
-            if 'range' in reqheaders:
+            range_ = reqheaders.get('range')
+            if range_:
                 rangeadded = False
-                range_ = reqheaders['range']
                 # check that range is within limits
                 try:
                     start, end = [int(i) for i in
@@ -167,7 +167,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                 except:
                     logging.debug('Error parsing range "%s": %s' % (range_, format_exc()))
                 else:
-                    if end - start >= RANGE_REQ_SIZE:
+                    if end - start + 1 > RANGE_REQ_SIZE:
                         newend = start + RANGE_REQ_SIZE - 1
                         logging.info('Requested range (%d-%d) too large, '
                             'shortening to %d-%d' % (start, end, start, newend))
