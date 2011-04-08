@@ -63,6 +63,7 @@ HEAD = 'head'
 PUT = 'put'
 POST = 'post'
 METHODS = frozenset((DELETE, GET, HEAD, PUT, POST))
+RANGE_METHODS = frozenset((GET,))
 PAYLOAD_METHODS = frozenset((PUT, POST))
 
 # http://code.google.com/appengine/docs/python/urlfetch/overview.html#Quotas_and_Limits
@@ -77,17 +78,16 @@ GAE_REQ_MAXSECS = 30
 
 RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
 
-_RANGE_REQ_SUFFIX = '. Range requested: bytes=%d-%d'
-
 # stamp our responses with this header
 EIGEN_HEADER_KEY = 'X-laeproxy'
+# indicates truncated response
+TRUNC_HEADER_KEY = 'X-laeproxy-truncated'
 # various values corresponding to possible results of proxy requests
 RETRIEVED_FROM_NET = 'Retrieved from network %s'
-RETRIEVED_FROM_CACHE = 'Retrieved from cache'
 IGNORED_RECURSIVE = 'Ignored recursive request'
 REQ_TOO_LARGE = 'Request size exceeds urlfetch limit'
-RES_TOO_LARGE = 'Response too large' + _RANGE_REQ_SUFFIX
-MISSED_DEADLINE_URLFETCH = 'Missed urlfetch deadline' + _RANGE_REQ_SUFFIX
+RES_TOO_LARGE = 'Response size exceeds urlfetch limit'
+MISSED_DEADLINE_URLFETCH = 'Missed urlfetch deadline'
 MISSED_DEADLINE_GAE = 'Missed GAE deadline'
 UNEXPECTED_ERROR = 'Unexpected error: %s'
 
@@ -116,10 +116,13 @@ class LaeproxyHandler(webapp.RequestHandler):
 
     def make_handler(method):
         assert method in METHODS, 'unsupported method: %s' % method
+        rangemethod = method in RANGE_METHODS
+        payloadmethod = method in PAYLOAD_METHODS
 
         def handler(self, *args, **kw):
             req = self.request
             res = self.response
+            reqheaders = req.headers
             resheaders = res.headers
 
             # reconstruct original url
@@ -143,37 +146,43 @@ class LaeproxyHandler(webapp.RequestHandler):
             url = scheme + '://' + host + '/' + rest
 
             # check payload
-            payload = req.body if method in PAYLOAD_METHODS else None
+            payload = req.body if payloadmethod else None
             if payload and len(payload) >= URLFETCH_REQ_MAXBYTES:
                 resheaders[EIGEN_HEADER_KEY] = REQ_TOO_LARGE
                 return self.error(413)
 
             # check headers
-            reqheaders = req.headers
             for i in IGNORE_HEADERS_REQ:
                 reqheaders.pop(i, None)
 
-            # always make range requests to avoid urlfetch.ResponseTooLargeError
-            start = 0
-            end = RANGE_REQ_SIZE
-            rangeadded = True
-            range_ = reqheaders.get('range')
-            if range_:
-                rangeadded = False
-                # check that range is within limits
-                try:
-                    start, end = [int(i) for i in
-                        range_.lstrip('bytes=').split('-', 1)]
-                except:
-                    logging.debug('Error parsing range "%s": %s' % (range_, format_exc()))
+            if rangemethod:
+                # always make range requests to avoid urlfetch.ResponseTooLargeError
+                if not req.range:
+                    rangeadded = True
+                    start = 0
+                    end = RANGE_REQ_SIZE - 1
+                    nbytesrequested = end - start + 1 # endpoints are inclusive
+                    rangestr = 'bytes=%d-%d' % (start, end)
+                    reqheaders['range'] = rangestr
+                    logging.debug('Added Range: %s' % rangestr)
                 else:
-                    if end - start + 1 > RANGE_REQ_SIZE:
-                        newend = start + RANGE_REQ_SIZE - 1
-                        logging.info('Requested range (%d-%d) too large, '
-                            'shortening to %d-%d' % (start, end, start, newend))
-                        end = newend
-            reqheaders['range'] = 'bytes=%d-%d' % (start, end)
-            nbytesrequested = end - start + 1 # endpoints are inclusive
+                    rangeadded = False
+                    nbytesrequested = None # will be calculated if possible
+                    ranges = req.range.ranges
+                    if len(ranges) == 1:
+                        start, end = ranges[0]
+                        if end is not None:
+                            end += 1 # webob uses uninclusive end
+                            nbytesrequested = end - start + 1
+                        elif start < 0:
+                            nbytesrequested = -start
+                    rangestr = reqheaders['range']
+                    if nbytesrequested:
+                        logging.debug('Range specified upstream: %s '
+                           '(%d bytes)' % (rangestr, nbytesrequested))
+                    else:
+                        logging.debug('Range specified upstream: %s '
+                           '(could not determine length)' % rangestr)
 
             # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
             # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
@@ -192,11 +201,11 @@ class LaeproxyHandler(webapp.RequestHandler):
             except urlfetch.InvalidURLError:
                 return self.error(404)
             except urlfetch.DownloadError:
-                resheaders[EIGEN_HEADER_KEY] = MISSED_DEADLINE_URLFETCH % (start, end)
+                resheaders[EIGEN_HEADER_KEY] = MISSED_DEADLINE_URLFETCH
                 return self.error(504)
             except urlfetch.ResponseTooLargeError:
                 # upstream server doesn't support range requests?
-                resheaders[EIGEN_HEADER_KEY] = RES_TOO_LARGE % (start, end)
+                resheaders[EIGEN_HEADER_KEY] = RES_TOO_LARGE
                 return self.error(503)
             except Exception, e:
                 logging.error('Unexpected error: %s' % e)
@@ -206,36 +215,51 @@ class LaeproxyHandler(webapp.RequestHandler):
 
             status = fetched.status_code
             res.set_status(status)
-
-            # change to 200 if we changed to range request and got entire entity
-            if rangeadded and status == 206:
-                try:
-                    crange = fetched.headers.get('content-range', '')
-                    sent, total = crange.lstrip('bytes ').split('/', 1)
-                    start, end = [int(i) for i in sent.split('-', 1)]
-                    total = int(total)
-                except:
-                    logging.debug('Error parsing content-range "%s": %s' % (crange, format_exc()))
-                else:
-                    if start == 0 and end == total - 1:
-                        logging.debug('Retrieved entire entity, changing 206 to 200')
-                        res.set_status(200)
-                        del fetched.headers['content-range']
+            content = fetched.content
+            contentlength = len(content)
 
             for k, v in fetched.headers.iteritems():
                 if k.lower() not in IGNORE_HEADERS_RES:
                     resheaders[k] = v
 
-            # XXX handle exceeding response limit by truncating?
-            content_length = len(fetched.content)
-            if content_length > nbytesrequested:
-                logging.info('Remote host returned %d bytes but %d were '
-                    'requested. (Doesn\'t support range requests? Status '
-                    'code was %d.)\nBody will be truncated!' %
-                    (content_length, nbytesrequested, status))
-                resheaders[EIGEN_HEADER_KEY] = 'Truncated! ' + resheaders[EIGEN_HEADER_KEY]
+            if rangemethod:
+                # change to 200 if we converted to range request and got back
+                # entire entity in a 206
+                if rangeadded and status == 206:
+                    try:
+                        crange = fetched.headers.get('content-range', '')
+                        sent, total = crange.lstrip('bytes ').split('/', 1)
+                        start, end = [int(i) for i in sent.split('-', 1)]
+                        total = int(total)
+                    except:
+                        logging.debug('Error parsing content-range "%s": %s' % (crange, format_exc()))
+                    else:
+                        if start == 0 and end == total - 1:
+                            logging.debug('Retrieved entire entity, changing 206 to 200')
+                            res.set_status(200)
+                            del resheaders['content-range']
 
-            res.out.write(fetched.content[:nbytesrequested])
+                # change to 206 if range request of determinate length made by
+                # upstream requester but upstream server gave back 200
+                # http://tools.ietf.org/html/rfc2616#section-14.35.2
+                elif not rangeadded and nbytesrequested and status == 200:
+                    logging.debug('Converting 200 response to 206')
+                    if end is None:
+                        end = contentlength - 1
+                    if contentlength != nbytesrequested: 
+                        logging.debug('Slicing content')
+                        content = content[start:end+1]
+                        contentlength = nbytesrequested
+                    res.set_status(206)
+                    resheaders['content-range'] = 'bytes %d-%d/%d' % (
+                        start, end, nbytesrequested)
+
+            if contentlength > RANGE_REQ_SIZE:
+                logging.info('Response too large, truncating!')
+                content = content[:RANGE_REQ_SIZE]
+                resheaders[TRUNC_HEADER_KEY] = 'True'
+
+            res.out.write(content)
 
         handler.func_name = method
         return handler
