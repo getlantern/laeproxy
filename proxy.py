@@ -180,6 +180,9 @@ class LaeproxyHandler(webapp.RequestHandler):
                     if nbytesrequested:
                         logging.debug('Range specified upstream: %s '
                            '(%d bytes)' % (rangestr, nbytesrequested))
+                        if nbytesrequested > RANGE_REQ_SIZE:
+                            logging.warn('Upstream range request size exceeds '
+                               ' GAE limit, will be truncated if fulfilled!')
                     else:
                         logging.debug('Range specified upstream: %s '
                            '(could not determine length)' % rangestr)
