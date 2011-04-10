@@ -89,7 +89,6 @@ UNTRUNC_LEN = 'X-laeproxy-untruncated-content-length'
 RETRIEVED_FROM_NET = 'Retrieved from network %s'
 IGNORED_RECURSIVE = 'Ignored recursive request'
 REQ_TOO_LARGE = 'Request size exceeds urlfetch limit'
-RES_TOO_LARGE = 'Response size exceeds urlfetch limit'
 MISSED_DEADLINE_URLFETCH = 'Missed urlfetch deadline'
 MISSED_DEADLINE_GAE = 'Missed GAE deadline'
 UNEXPECTED_ERROR = 'Unexpected error: %r'
@@ -123,6 +122,10 @@ class LaeproxyHandler(webapp.RequestHandler):
         payloadmethod = method in PAYLOAD_METHODS
 
         def handler(self, *args, **kw):
+            # in development, this doesn't stick at module scope :\
+            if DEVELOPMENT and DEBUG:
+                logging.getLogger().setLevel(logging.DEBUG)
+
             req = self.request
             res = self.response
             reqheaders = req.headers
@@ -161,7 +164,9 @@ class LaeproxyHandler(webapp.RequestHandler):
             if rangemethod:
                 # always make range requests to avoid hitting app engine limits
                 if not req.range:
-                    rangeadded = True
+                    if reqheaders['range']:
+                        logging.debug('Bad Range specified upstream ("%s"), ignoring' % reqheaders['range'])
+                    rangeadded = True # we are adding the range header
                     start = 0
                     end = RANGE_REQ_SIZE - 1
                     nbytesrequested = end - start + 1 # endpoints are inclusive
@@ -169,10 +174,12 @@ class LaeproxyHandler(webapp.RequestHandler):
                     reqheaders['range'] = rangestr
                     logging.debug('Added Range: %s' % rangestr)
                 else:
-                    rangeadded = False
+                    rangeadded = False # range header already present
+                    singlerange = False # only a single range given
                     nbytesrequested = None # will be calculated if possible
                     ranges = req.range.ranges
                     if len(ranges) == 1:
+                        singlerange = True
                         start, end = ranges[0]
                         if end is not None:
                             end += 1 # webob uses uninclusive end
@@ -251,69 +258,84 @@ class LaeproxyHandler(webapp.RequestHandler):
                 if status == 200:
                     logging.debug('Got 200 response to range request')
 
-                    # change to 206 if range request of determinate length made
-                    # by upstream requester but upstream server does not support
+                    # if we added the range header and got back a 200, just
+                    # return it as is. if urlfetch truncated it, we'll have to
+                    # truncate it further when we check for exceeding
+                    # RANGE_REQ_SIZE at the end.
+
+                    # change to 206 if range request made by upstream requester
+                    # but upstream server does not support range requests
+                    # see last paragraph (re proxies) of
                     # http://tools.ietf.org/html/rfc2616#section-14.35.2
-                    # (only useful if we can grab a full response from urlfetch)
-                    if not truncated and not rangeadded and nbytesrequested:
+                    if not rangeadded and (not truncated or untrunclen):
                         logging.debug('Converting 200 response to 206')
-                        total = contentlen
-                        if end is None:
-                            # since the length of the requested range is known,
-                            # it must be of the form "-x"
-                            assert start < 0, 'Expected upstream range request of the form "-x"'
-                            start += contentlen
+                        if truncated:
+                            logging.debug('Using untruncated content length (%d) as total' % untrunclen)
+                            total = untrunclen
+                        else:
+                            total = contentlen
+                        needslice = False
+                        if nbytesrequested:
+                            if end is None:
+                                # since the length of the requested range is
+                                # known, it must be of the form "-x"
+                                assert start < 0, 'Expected upstream range request of the form "-x"'
+                                start += contentlen
+                                end = contentlen - 1
+                                logging.debug('Adjusted (start, end): (%d, %d)' % (start, end))
+                            needslice = contentlen != nbytesrequested
+                        elif singlerange:
+                            assert end is None, 'Expected upstream range request of the form "x-"'
                             end = contentlen - 1
-                        if contentlen != nbytesrequested: 
-                            logging.debug('Slicing content')
-                            # XXX cache discarded content for subsequent requests
+                            logging.debug('Populated end: %d' % end)
+                            if start > end:
+                                logging.debug('Requested start position is beyond end position, not satisfiable')
+                                resheaders['content-range'] = 'bytes */%d' % total
+                                return self.error(416)
+                            needslice = start != 0
+                        if needslice:
+                            logging.debug('Slicing content [%d:%d]' % (start, end+1))
+                            # XXX cache discarded content for subsequent requests if cache policy allows
                             content = content[start:end+1]
                         res.set_status(206)
-                        resheaders['content-range'] = 'bytes %d-%d/%d' % (
-                            start, end, total)
+                        resheaders['content-range'] = 'bytes %d-%d/%d' % (start, end, total)
                         logging.debug('Adjusted Content-Range: %d-%d/%d' % (start, end, total))
 
                 elif status == 206:
                     try:
                         crange = fheaders.get('content-range', '')
-                        assert crange.startswith('bytes ')
+                        assert crange.startswith('bytes '), 'Content-Range only supported in bytes'
                         sent, total = crange[6:].split('/', 1)
                         start, end = [int(i) for i in sent.split('-', 1)]
                         total = int(total)
                     except:
-                        logging.info('Error parsing content-range: %r' % crange)
+                        logging.info('Error parsing Content-Range: %r' % crange)
                         logging.debug(format_exc())
                     else:
-                        logging.debug('Parsed content-range: %d-%d/%d' % (start, end, total))
+                        logging.debug('Parsed Content-Range: %d-%d/%d' % (start, end, total))
 
-                        # adjust content-range for truncation
-                        if truncated:
-                            diff = (end - start + 1) - contentlen
-                            assert diff > 0, 'urlfetch truncated content but nbytes sent does not exceed nbytes received (difference: %d)' % diff
-                            end -= diff
-                            resheaders['content-range'] = \
-                                'bytes %d-%d/%d' % (start, end, total)
-                            logging.debug('urlfetch truncated %d bytes. Changed "end" to %d' % (diff, end))
+                        # if urlfetch truncated, we'll have to truncate further
+                        # when we check for exceeding RANGE_REQ_SIZE at the end.
+                        # we adjust content-range if necessary then.
 
                         # change to 200 if we converted to range request and
                         # got back entire entity in a 206
-                        elif rangeadded and start == 0 and end == total - 1:
+                        if not truncated and rangeadded and start == 0 and end == total - 1:
                             logging.debug('Retrieved entire entity, changing 206 to 200')
                             res.set_status(200)
                             del resheaders['content-range']
 
-            finalcontentlen = len(content)
+            finalcontentlen = len(content) # could have been sliced above
             if finalcontentlen > RANGE_REQ_SIZE:
                 diff = finalcontentlen - RANGE_REQ_SIZE
                 logging.info('Response is %d bytes, max is %d. Truncating %d bytes!' % (finalcontentlen, RANGE_REQ_SIZE, diff))
                 content = content[:RANGE_REQ_SIZE]
-                resheaders[TRUNC_HEADER_KEY] = 'True'
+                resheaders[TRUNC_HEADER_KEY] = '%s' % True
                 if res.status == 206:
-                    # adjust content-range for truncation again
-                    end -= diff
-                    resheaders['content-range'] = 'bytes %d-%d/%d' % (
-                        start, end, total)
-                    logging.debug('Adjusted Content-Range: %d-%d/%d' % (start, end, total))
+                    # adjust content-range for truncation
+                    newend = end - diff
+                    resheaders['content-range'] = 'bytes %d-%d/%d' % (start, newend, total)
+                    logging.debug('Changed "end" from %d to %d' % (end, newend))
 
             res.out.write(content)
 
