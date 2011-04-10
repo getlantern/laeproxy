@@ -39,13 +39,14 @@ import logging
 
 now = datetime.utcnow
 
-#DEBUG = environ.get('SERVER_SOFTWARE', '').startswith('Dev')
+DEVELOPMENT = environ.get('SERVER_SOFTWARE', '').startswith('Dev')
+#DEBUG = DEVELOPMENT
 DEBUG = True
 if DEBUG:
     logging.getLogger().setLevel(logging.DEBUG)
 
 def _breakpoint():
-    if not DEBUG: return
+    if not DEVELOPMENT: return
     import sys, pdb
     def swap():
         for i in ('stdin', 'stdout', 'stderr'):
@@ -76,12 +77,15 @@ GAE_REQ_MAXBYTES = 1024 * 1024 * 10
 GAE_RES_MAXBYTES = 1024 * 1024 * 10
 GAE_REQ_MAXSECS = 30
 
-RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
+#RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
+RANGE_REQ_SIZE = 1024 * 1024 # XXX for debug
 
 # stamp our responses with this header
 EIGEN_HEADER_KEY = 'X-laeproxy'
 # indicates truncated response
 TRUNC_HEADER_KEY = 'X-laeproxy-truncated'
+# specifies full length of an entity that has been truncated
+UNTRUNC_LEN = 'X-laeproxy-untruncated-len'
 # various values corresponding to possible results of proxy requests
 RETRIEVED_FROM_NET = 'Retrieved from network %s'
 IGNORED_RECURSIVE = 'Ignored recursive request'
@@ -89,7 +93,7 @@ REQ_TOO_LARGE = 'Request size exceeds urlfetch limit'
 RES_TOO_LARGE = 'Response size exceeds urlfetch limit'
 MISSED_DEADLINE_URLFETCH = 'Missed urlfetch deadline'
 MISSED_DEADLINE_GAE = 'Missed GAE deadline'
-UNEXPECTED_ERROR = 'Unexpected error: %s'
+UNEXPECTED_ERROR = 'Unexpected error: %r'
 
 IGNORE_HEADERS_REQ = frozenset((
     'content-length',
@@ -156,7 +160,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                 reqheaders.pop(i, None)
 
             if rangemethod:
-                # always make range requests to avoid urlfetch.ResponseTooLargeError
+                # always make range requests to avoid hitting app engine limits
                 if not req.range:
                     rangeadded = True
                     start = 0
@@ -178,14 +182,11 @@ class LaeproxyHandler(webapp.RequestHandler):
                             nbytesrequested = -start
                     rangestr = reqheaders['range']
                     if nbytesrequested:
-                        logging.debug('Range specified upstream: %s '
-                           '(%d bytes)' % (rangestr, nbytesrequested))
+                        logging.debug('Range specified upstream: %s (%d bytes)' % (rangestr, nbytesrequested))
                         if nbytesrequested > RANGE_REQ_SIZE:
-                            logging.warn('Upstream range request size exceeds '
-                               ' GAE limit, will be truncated if fulfilled!')
+                            logging.warn('Upstream range request size exceeds App Engine response size limit')
                     else:
-                        logging.debug('Range specified upstream: %s '
-                           '(could not determine length)' % rangestr)
+                        logging.debug('Range specified upstream: %s (could not determine length)' % rangestr)
 
             # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
             # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
@@ -195,7 +196,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                     payload=payload,
                     method=method,
                     headers=reqheaders,
-                    allow_truncated=False,
+                    allow_truncated=True,
                     follow_redirects=False,
                     deadline=URLFETCH_REQ_MAXSECS,
                     validate_certificate=True,
@@ -206,12 +207,8 @@ class LaeproxyHandler(webapp.RequestHandler):
             except urlfetch.DownloadError:
                 resheaders[EIGEN_HEADER_KEY] = MISSED_DEADLINE_URLFETCH
                 return self.error(504)
-            except urlfetch.ResponseTooLargeError:
-                # upstream server doesn't support range requests?
-                resheaders[EIGEN_HEADER_KEY] = RES_TOO_LARGE
-                return self.error(503)
             except Exception, e:
-                logging.error('Unexpected error: %s' % e)
+                logging.error('Unexpected error: %r' % e)
                 logging.debug(format_exc())
                 resheaders[EIGEN_HEADER_KEY] = UNEXPECTED_ERROR % e
                 return self.error(500)
@@ -219,45 +216,87 @@ class LaeproxyHandler(webapp.RequestHandler):
             status = fetched.status_code
             res.set_status(status)
             content = fetched.content
-            contentlength = len(content)
+            contentlen = len(content)
+
+            truncated = fetched.content_was_truncated
+            untrunclen = None
+            if truncated:
+                logging.warn('urlfetch returned truncated content')
+                # if 200 status, try to determine full content length via HEAD
+                if status == 200:
+                    logging.debug('Attempting to determine untruncated length via HEAD')
+                    try:
+                        hd = urlfetch.fetch(url,
+                            method=HEAD,
+                            headers=reqheaders,
+                            follow_redirects=False,
+                            deadline=URLFETCH_REQ_MAXSECS,
+                            validate_certificate=True,
+                            )
+                        untrunclen = hd.headers.get('content-length')
+                        logging.debug('untruncated length: %r' % untrunclen)
+                        if untrunclen:
+                            resheaders[UNTRUNC_LEN] = untrunclen
+                            untrunclen = int(untrunclen)
+                    except Exception, e:
+                        logging.error('Error handling HEAD request: %r' % e)
+                        logging.debug(format_exc())
 
             for k, v in fetched.headers.iteritems():
                 if k.lower() not in IGNORE_HEADERS_RES:
                     resheaders[k] = v
 
             if rangemethod:
-                # change to 200 if we converted to range request and got back
-                # entire entity in a 206
-                if rangeadded and status == 206:
+                if status == 200:
+                    logging.debug('Got 200 response to range request')
+
+                    # change to 206 if range request of determinate length made
+                    # by upstream requester but upstream server does not support
+                    # http://tools.ietf.org/html/rfc2616#section-14.35.2
+                    # (only useful if we can grab a full response from urlfetch)
+                    if not truncated and not rangeadded and nbytesrequested:
+                        logging.debug('Converting 200 response to 206')
+                        if end is None:
+                            end = contentlen - 1
+                        if contentlen != nbytesrequested: 
+                            logging.debug('Slicing content')
+                            # XXX cache discarded content for subsequent requests
+                            content = content[start:end+1]
+                            contentlen = nbytesrequested
+                        res.set_status(206)
+                        resheaders['content-range'] = 'bytes %d-%d/%d' % (
+                            start, end, nbytesrequested)
+                        logging.debug('Sending Content-Range: %d-%d/%d' % (start, end, nbytesrequested))
+
+                elif status == 206:
                     try:
                         crange = fetched.headers.get('content-range', '')
-                        sent, total = crange.lstrip('bytes ').split('/', 1)
+                        assert crange.startswith('bytes ')
+                        sent, total = crange[6:].split('/', 1)
                         start, end = [int(i) for i in sent.split('-', 1)]
                         total = int(total)
                     except:
-                        logging.debug('Error parsing content-range "%s": %s' % (crange, format_exc()))
+                        logging.info('Error parsing content-range: %r' % crange)
+                        logging.debug(format_exc())
                     else:
-                        if start == 0 and end == total - 1:
+                        logging.debug('Parsed content-range: %d-%d/%d' % (start, end, total))
+
+                        # adjust for truncation
+                        if truncated:
+                            diff = (end - start + 1) - contentlen
+                            end -= diff
+                            resheaders['content-range'] = \
+                                'bytes %d-%d/%d' % (start, end, total)
+                            logging.debug('Response was truncated by %d bytes. Changed "end" to %d' % (diff, end))
+
+                        # change to 200 if we converted to range request and
+                        # got back entire entity in a 206
+                        elif rangeadded and start == 0 and end == total - 1:
                             logging.debug('Retrieved entire entity, changing 206 to 200')
                             res.set_status(200)
                             del resheaders['content-range']
 
-                # change to 206 if range request of determinate length made by
-                # upstream requester but upstream server gave back 200
-                # http://tools.ietf.org/html/rfc2616#section-14.35.2
-                elif not rangeadded and nbytesrequested and status == 200:
-                    logging.debug('Converting 200 response to 206')
-                    if end is None:
-                        end = contentlength - 1
-                    if contentlength != nbytesrequested: 
-                        logging.debug('Slicing content')
-                        content = content[start:end+1]
-                        contentlength = nbytesrequested
-                    res.set_status(206)
-                    resheaders['content-range'] = 'bytes %d-%d/%d' % (
-                        start, end, nbytesrequested)
-
-            if contentlength > RANGE_REQ_SIZE:
+            if contentlen > RANGE_REQ_SIZE:
                 logging.info('Response too large, truncating!')
                 content = content[:RANGE_REQ_SIZE]
                 resheaders[TRUNC_HEADER_KEY] = 'True'
@@ -286,7 +325,7 @@ app = webapp.WSGIApplication((
     ), debug=DEBUG)
 
 def main():
-    if DEBUG:
+    if DEVELOPMENT:
         from wsgiref.handlers import CGIHandler
         CGIHandler().run(app)
     else:
