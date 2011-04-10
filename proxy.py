@@ -77,15 +77,14 @@ GAE_REQ_MAXBYTES = 1024 * 1024 * 10
 GAE_RES_MAXBYTES = 1024 * 1024 * 10
 GAE_REQ_MAXSECS = 30
 
-#RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
-RANGE_REQ_SIZE = 1024 * 1024 # XXX for debug
+RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
 
 # stamp our responses with this header
 EIGEN_HEADER_KEY = 'X-laeproxy'
 # indicates truncated response
 TRUNC_HEADER_KEY = 'X-laeproxy-truncated'
 # specifies full length of an entity that has been truncated
-UNTRUNC_LEN = 'X-laeproxy-untruncated-len'
+UNTRUNC_LEN = 'X-laeproxy-untruncated-content-length'
 # various values corresponding to possible results of proxy requests
 RETRIEVED_FROM_NET = 'Retrieved from network %s'
 IGNORED_RECURSIVE = 'Ignored recursive request'
@@ -213,17 +212,23 @@ class LaeproxyHandler(webapp.RequestHandler):
                 resheaders[EIGEN_HEADER_KEY] = UNEXPECTED_ERROR % e
                 return self.error(500)
 
+            fheaders = fetched.headers
+            logging.debug('urlfetch response headers: %r' % fheaders)
+            for k, v in fheaders.iteritems():
+                if k.lower() not in IGNORE_HEADERS_RES:
+                    resheaders[k] = v
+
             status = fetched.status_code
             res.set_status(status)
             content = fetched.content
             contentlen = len(content)
 
             truncated = fetched.content_was_truncated
+            # will be populated with length of untruncated content if possible
             untrunclen = None
             if truncated:
                 logging.warn('urlfetch returned truncated content')
-                # if 200 status, try to determine full content length via HEAD
-                if status == 200:
+                if method == GET and status == 200:
                     logging.debug('Attempting to determine untruncated length via HEAD')
                     try:
                         hd = urlfetch.fetch(url,
@@ -242,10 +247,6 @@ class LaeproxyHandler(webapp.RequestHandler):
                         logging.error('Error handling HEAD request: %r' % e)
                         logging.debug(format_exc())
 
-            for k, v in fetched.headers.iteritems():
-                if k.lower() not in IGNORE_HEADERS_RES:
-                    resheaders[k] = v
-
             if rangemethod:
                 if status == 200:
                     logging.debug('Got 200 response to range request')
@@ -256,21 +257,25 @@ class LaeproxyHandler(webapp.RequestHandler):
                     # (only useful if we can grab a full response from urlfetch)
                     if not truncated and not rangeadded and nbytesrequested:
                         logging.debug('Converting 200 response to 206')
+                        total = contentlen
                         if end is None:
+                            # since the length of the requested range is known,
+                            # it must be of the form "-x"
+                            assert start < 0, 'Expected upstream range request of the form "-x"'
+                            start += contentlen
                             end = contentlen - 1
                         if contentlen != nbytesrequested: 
                             logging.debug('Slicing content')
                             # XXX cache discarded content for subsequent requests
                             content = content[start:end+1]
-                            contentlen = nbytesrequested
                         res.set_status(206)
                         resheaders['content-range'] = 'bytes %d-%d/%d' % (
-                            start, end, nbytesrequested)
-                        logging.debug('Sending Content-Range: %d-%d/%d' % (start, end, nbytesrequested))
+                            start, end, total)
+                        logging.debug('Adjusted Content-Range: %d-%d/%d' % (start, end, total))
 
                 elif status == 206:
                     try:
-                        crange = fetched.headers.get('content-range', '')
+                        crange = fheaders.get('content-range', '')
                         assert crange.startswith('bytes ')
                         sent, total = crange[6:].split('/', 1)
                         start, end = [int(i) for i in sent.split('-', 1)]
@@ -281,13 +286,14 @@ class LaeproxyHandler(webapp.RequestHandler):
                     else:
                         logging.debug('Parsed content-range: %d-%d/%d' % (start, end, total))
 
-                        # adjust for truncation
+                        # adjust content-range for truncation
                         if truncated:
                             diff = (end - start + 1) - contentlen
+                            assert diff > 0, 'urlfetch truncated content but nbytes sent does not exceed nbytes received (difference: %d)' % diff
                             end -= diff
                             resheaders['content-range'] = \
                                 'bytes %d-%d/%d' % (start, end, total)
-                            logging.debug('Response was truncated by %d bytes. Changed "end" to %d' % (diff, end))
+                            logging.debug('urlfetch truncated %d bytes. Changed "end" to %d' % (diff, end))
 
                         # change to 200 if we converted to range request and
                         # got back entire entity in a 206
@@ -296,10 +302,18 @@ class LaeproxyHandler(webapp.RequestHandler):
                             res.set_status(200)
                             del resheaders['content-range']
 
-            if contentlen > RANGE_REQ_SIZE:
-                logging.info('Response too large, truncating!')
+            finalcontentlen = len(content)
+            if finalcontentlen > RANGE_REQ_SIZE:
+                diff = finalcontentlen - RANGE_REQ_SIZE
+                logging.info('Response is %d bytes, max is %d. Truncating %d bytes!' % (finalcontentlen, RANGE_REQ_SIZE, diff))
                 content = content[:RANGE_REQ_SIZE]
                 resheaders[TRUNC_HEADER_KEY] = 'True'
+                if res.status == 206:
+                    # adjust content-range for truncation again
+                    end -= diff
+                    resheaders['content-range'] = 'bytes %d-%d/%d' % (
+                        start, end, total)
+                    logging.debug('Adjusted Content-Range: %d-%d/%d' % (start, end, total))
 
             res.out.write(content)
 
