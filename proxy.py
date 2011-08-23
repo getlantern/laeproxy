@@ -3,15 +3,15 @@
 # Lantern App Engine Proxy
 #
 # Derived from <http://code.google.com/p/mirrorrr> by Brett Slatkin
-# <bslatkin@gmail.com> (see original copyright notice below)
 #
 # Modified for use with Lantern <http://www.getlantern.org> by
 # Brave New Software <http://www.bravenewsoftware.org>
 #
-# Any copyrightable modifications by Brave New Software are copyright 2011
-# Brave New Software and are hereby redistributed under the terms of the
-# license of the original work, which follows:
-
+# Modifications are copyright 2011 Brave New Software and are licensed
+# under the same license as the original work.
+#
+# Original copyright notice:
+#
 # Copyright 2008 Brett Slatkin
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,34 +38,28 @@ from google.appengine.runtime import DeadlineExceededError
 import logging
 
 now = datetime.utcnow
+logger = logging.getLogger('laeproxy')
+logger.setLevel(logging.DEBUG)
 
-DEVELOPMENT = environ.get('SERVER_SOFTWARE', '').startswith('Dev')
-#DEBUG = DEVELOPMENT
-DEBUG = True
-if DEBUG:
-    logging.getLogger().setLevel(logging.DEBUG)
+PROD = environ.get('SERVER_SOFTWARE', '').startswith('Google App Engine')
+DEV = not PROD
 
-def _breakpoint():
-    if not DEVELOPMENT: return
-    import sys, pdb
-    def swap():
-        for i in ('stdin', 'stdout', 'stderr'):
-            i_ = '__%s__' % i
-            tmp = getattr(sys, i)
-            setattr(sys, i, getattr(sys, i_))
-            setattr(sys, i_, tmp)
-    swap()
-    pdb.set_trace()
-    swap()
+if DEV:
+    def _breakpoint():
+        import sys, pdb
+        def swap():
+            for i in ('stdin', 'stdout', 'stderr'):
+                i_ = '__%s__' % i
+                tmp = getattr(sys, i)
+                setattr(sys, i, getattr(sys, i_))
+                setattr(sys, i_, tmp)
+        swap()
+        pdb.set_trace()
+        swap()
 
-DELETE = 'delete'
-GET = 'get'
-HEAD = 'head'
-PUT = 'put'
-POST = 'post'
-METHODS = frozenset((DELETE, GET, HEAD, PUT, POST))
-RANGE_METHODS = frozenset((GET,))
-PAYLOAD_METHODS = frozenset((PUT, POST))
+METHODS = frozenset(('delete', 'get', 'head', 'put', 'post'))
+RANGE_METHODS = frozenset(('get',))
+PAYLOAD_METHODS = frozenset(('put', 'post'))
 
 # http://code.google.com/appengine/docs/python/urlfetch/overview.html#Quotas_and_Limits
 URLFETCH_REQ_MAXBYTES = 1024 * 1024 # 1MB
@@ -73,8 +67,8 @@ URLFETCH_RES_MAXBYTES = 1024 * 1024 * 32
 # http://code.google.com/appengine/docs/python/urlfetch/fetchfunction.html
 URLFETCH_REQ_MAXSECS = 10
 # http://code.google.com/appengine/docs/python/runtime.html#Quotas_and_Limits
-GAE_REQ_MAXBYTES = 1024 * 1024 * 10
-GAE_RES_MAXBYTES = 1024 * 1024 * 10
+GAE_REQ_MAXBYTES = 1024 * 1024 * 32
+GAE_RES_MAXBYTES = 1024 * 1024 * 32
 GAE_REQ_MAXSECS = 30
 
 RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
@@ -97,23 +91,15 @@ MISSED_DEADLINE_URLFETCH = 'Missed urlfetch deadline'
 MISSED_DEADLINE_GAE = 'Missed GAE deadline'
 UNEXPECTED_ERROR = 'Unexpected error: %r'
 
-IGNORE_HEADERS_REQ = frozenset((
-    'content-length',
-    'host',
-    'vary',
-    'via',
-    'x-forwarded-for',
-    ))
-
-IGNORE_HEADERS_RES = frozenset((
-    # ignore hop-by-hop headers
-    # http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
+# remove hop-by-hop headers
+# http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
+HOPBYHOP = frozenset((
     'connection',
     'keep-alive',
     'proxy-authenticate',
     'proxy-authorization',
     'te',
-    'trailers',
+    'trailer',
     'transfer-encoding',
     'upgrade',
     ))
@@ -126,10 +112,6 @@ class LaeproxyHandler(webapp.RequestHandler):
         payloadmethod = method in PAYLOAD_METHODS
 
         def handler(self, *args, **kw):
-            # need this here in development, doesn't stick at module scope
-            if DEVELOPMENT and DEBUG:
-                logging.getLogger().setLevel(logging.DEBUG)
-
             req = self.request
             res = self.response
             reqheaders = req.headers
@@ -149,35 +131,50 @@ class LaeproxyHandler(webapp.RequestHandler):
             host = unquote(parts[0])
             if not host:
                 return self.error(404)
-            if req.host == host:
-                logging.info('Ignoring recursive request %s' % req.url)
+            if req.host.lower() == host.lower():
+                logger.info('Ignoring recursive request %s' % req.url)
                 resheaders[EIGEN_HEADER_KEY] = IGNORED_RECURSIVE
                 return self.error(404)
             url = scheme + '://' + host + '/' + rest
+            logger.debug('Target url: %s' % url)
 
             # check payload
             payload = req.body if payloadmethod else None
-            if payload and len(payload) >= URLFETCH_REQ_MAXBYTES:
+            payloadlen = len(payload) if payload else 0
+            if payloadlen >= URLFETCH_REQ_MAXBYTES:
                 resheaders[EIGEN_HEADER_KEY] = REQ_TOO_LARGE
                 return self.error(413)
 
-            # check headers
-            for i in IGNORE_HEADERS_REQ:
-                reqheaders.pop(i, None)
+            # XXX http://code.google.com/p/googleappengine/issues/detail?id=4879
+            if 'content-length' not in reqheaders:
+                logger.debug('Adding Content-Length: %d' % payloadlen)
+                reqheaders['content-length'] = str(payloadlen)
+            # even this triggers KeyError('Content-Length') without the above:
+            logger.debug('Request headers: %r' % reqheaders)
+
+            # strip hop-by-hop headers
+            ignoreheaders = HOPBYHOP | set(i.strip() for i in
+                reqheaders.get('connection', '').lower().split(',') if i.strip())
+            ignored = []
+            for i in ignoreheaders:
+                if i in reqheaders:
+                    ignored.append(reqheaders.pop(i))
+            if ignored:
+                logger.debug('Ignored request headers: %r' % ignored)
 
             if rangemethod:
                 # add Range header to avoid hitting app engine limits
                 if not req.range:
                     unparsed_range = reqheaders.get('range')
                     if unparsed_range:
-                        logging.debug('Could not parse Range specified upstream ("%s"), overwriting' % unparsed_range)
+                        logger.debug('Could not parse Range specified upstream ("%s"), overwriting' % unparsed_range)
                     rangeadded = True # we are adding the range header
                     start = 0
                     end = RANGE_REQ_SIZE - 1
                     nbytesrequested = end - start + 1 # endpoints are inclusive
                     rangestr = 'bytes=%d-%d' % (start, end)
                     reqheaders['range'] = rangestr
-                    logging.debug('Added Range: %s' % rangestr)
+                    logger.debug('Added Range: %s' % rangestr)
                 else:
                     rangeadded = False # Range header already present
                     singlerange = False # only a single range given
@@ -193,11 +190,11 @@ class LaeproxyHandler(webapp.RequestHandler):
                             nbytesrequested = -start
                     rangestr = reqheaders['range']
                     if nbytesrequested:
-                        logging.debug('Range specified upstream: %s (%d bytes)' % (rangestr, nbytesrequested))
+                        logger.debug('Range specified upstream: %s (%d bytes)' % (rangestr, nbytesrequested))
                         if nbytesrequested > RANGE_REQ_SIZE:
-                            logging.warn('Upstream range request size exceeds App Engine response size limit')
+                            logger.warn('Upstream range request size exceeds App Engine response size limit')
                     else:
-                        logging.debug('Range specified upstream: %s (could not determine length)' % rangestr)
+                        logger.debug('Range specified upstream: %s (could not determine length)' % rangestr)
 
             # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
             # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
@@ -219,16 +216,25 @@ class LaeproxyHandler(webapp.RequestHandler):
                 resheaders[EIGEN_HEADER_KEY] = MISSED_DEADLINE_URLFETCH
                 return self.error(504)
             except Exception, e:
-                logging.error('Unexpected error: %r' % e)
-                logging.debug(format_exc())
+                logger.error('Unexpected error: %r' % e)
+                logger.debug(format_exc())
                 resheaders[EIGEN_HEADER_KEY] = UNEXPECTED_ERROR % e
                 return self.error(500)
 
             fheaders = fetched.headers
-            logging.debug('urlfetch response headers: %r' % fheaders)
+            logger.debug('urlfetch response headers: %r' % fheaders)
+
+            # strip hop-by-hop headers
+            ignoreheaders = HOPBYHOP | set(i.strip() for i in
+                fheaders.get('connection', '').lower().split(',') if i.strip())
+            ignored = []
             for k, v in fheaders.iteritems():
-                if k.lower() not in IGNORE_HEADERS_RES:
+                if k.lower() not in ignoreheaders:
                     resheaders[k] = v
+                else:
+                    ignored.append(k)
+            if ignored:
+                logger.debug('Ignored response headers: %r' % ignored)
 
             status = fetched.status_code
             res.set_status(status)
@@ -237,11 +243,11 @@ class LaeproxyHandler(webapp.RequestHandler):
 
             trunc = fetched.content_was_truncated
             if trunc:
-                logging.warn('urlfetch returned truncated content')
+                logger.warn('urlfetch returned truncated content')
 
             if rangemethod:
                 if status == 200:
-                    logging.debug('Got 200 response to range request')
+                    logger.debug('Got 200 response to range request')
                     resheaders[UPSTREAM_206] = 'False'
 
                     # If we added the Range header and got back a 200, just
@@ -259,7 +265,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                     # don't know the content length of the untruncated content
                     # and therefore can't populate Content-Range ourselves.
                     if not rangeadded and not trunc:
-                        logging.debug('Converting 200 response to 206')
+                        logger.debug('Converting 200 response to 206')
                         total = contentlen
                         needslice = False
                         if nbytesrequested:
@@ -269,24 +275,24 @@ class LaeproxyHandler(webapp.RequestHandler):
                                 assert start < 0, 'Expected upstream range request of the form "-x"'
                                 start += contentlen
                                 end = contentlen - 1
-                                logging.debug('Adjusted (start, end): (%d, %d)' % (start, end))
+                                logger.debug('Adjusted (start, end): (%d, %d)' % (start, end))
                             needslice = contentlen != nbytesrequested
                         elif singlerange:
                             assert end is None, 'Expected upstream range request of the form "x-"'
                             end = contentlen - 1
-                            logging.debug('Populated end: %d' % end)
+                            logger.debug('Populated end: %d' % end)
                             if start > end:
-                                logging.debug('Requested start position is beyond end position, not satisfiable')
+                                logger.debug('Requested start position is beyond end position, not satisfiable')
                                 resheaders['content-range'] = 'bytes */%d' % total
                                 return self.error(416)
                             needslice = start != 0
                         if needslice:
-                            logging.debug('Slicing content [%d:%d]' % (start, end+1))
+                            logger.debug('Slicing content [%d:%d]' % (start, end+1))
                             # XXX cache discarded content for subsequent requests if cache policy allows
                             content = content[start:end+1]
                         res.set_status(206)
                         resheaders['content-range'] = 'bytes %d-%d/%d' % (start, end, total)
-                        logging.debug('Sending Content-Range: %d-%d/%d' % (start, end, total))
+                        logger.debug('Sending Content-Range: %d-%d/%d' % (start, end, total))
 
                 elif status == 206:
                     resheaders[UPSTREAM_206] = 'True'
@@ -295,7 +301,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                     # if we added the Range header, it's against the HTTP spec
                     # to send 206 downstream, so change to 200
                     if rangeadded:
-                        logging.debug('Changing 206 to 200')
+                        logger.debug('Changing 206 to 200')
                         res.set_status(200)
                         fheaders.pop('content-range', '')
                     try:
@@ -304,31 +310,32 @@ class LaeproxyHandler(webapp.RequestHandler):
                         start, end = [int(i) for i in sent.split('-', 1)]
                         total = int(total)
                     except Exception, e:
-                        logging.info('Error parsing Content-Range %r: %r' % (crange, e))
-                        logging.debug(format_exc())
+                        logger.info('Error parsing Content-Range %r: %r' % (crange, e))
+                        logger.debug(format_exc())
                     else:
-                        logging.debug('Parsed Content-Range: %d-%d/%d' % (start, end, total))
+                        logger.debug('Parsed Content-Range: %d-%d/%d' % (start, end, total))
 
             finalcontentlen = len(content) # could have been sliced above
             if finalcontentlen > RANGE_REQ_SIZE:
                 diff = finalcontentlen - RANGE_REQ_SIZE
-                logging.info('Content is %d bytes, max is %d. Truncating %d bytes.' % (finalcontentlen, RANGE_REQ_SIZE, diff))
+                logger.info('Content is %d bytes, max is %d. Truncating %d bytes.' % (finalcontentlen, RANGE_REQ_SIZE, diff))
                 content = content[:RANGE_REQ_SIZE]
                 resheaders[TRUNC_HEADER_KEY] = 'True'
 
             finalcontentlen = len(content) # could have been sliced above
             # adjust content-range for truncation if necessary
-            if res.status == 206 :
+            if res.status == 206:
                 try:
                     realend = start + finalcontentlen - 1
                     if end != realend:
                         crange = 'bytes %d-%d/%d' % (start, realend, total)
                         resheaders['content-range'] = crange
-                        logging.debug('Changed "end" from %d to %d. Sending Content-Range: %s' % (end, realend, crange))
+                        logger.debug('Changed "end" from %d to %d. Sending Content-Range: %s' % (end, realend, crange))
                 except Exception, e:
                     log.error('Error adjusting Content-Range for truncation: %r' % e)
-                    logging.debug(format_exc())
+                    logger.debug(format_exc())
 
+            logger.debug('final response headers: %r' % resheaders)
             res.out.write(content)
 
         handler.func_name = method
@@ -350,10 +357,10 @@ class LaeproxyHandler(webapp.RequestHandler):
 
 app = webapp.WSGIApplication((
     (r'/http(s)?/.*', LaeproxyHandler),
-    ), debug=DEBUG)
+    ), debug=DEV)
 
 def main():
-    if DEVELOPMENT:
+    if DEV:
         from wsgiref.handlers import CGIHandler
         CGIHandler().run(app)
     else:
