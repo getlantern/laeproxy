@@ -1,11 +1,10 @@
-application: laeproxy
-#application: racheljohnsonftw
-#application: racheljohnsonla
+application: laeproxyhr1
 version: dev
-runtime: python
+runtime: python27
+threadsafe: yes
 api_version: 1
 
 handlers:
 - url: /http(s)?/.*
-  script: proxy.py
+  script: proxy.app
   secure: always
