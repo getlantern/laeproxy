@@ -1,19 +1,34 @@
 #!/usr/bin/env python
 
 # Lantern App Engine Proxy
+# ------------------------
+
+# Derivative work of Mirrorrr <http://code.google.com/p/mirrorrr>
+
+# Copyright 2011 the Lantern developers <http://www.getlantern.org>
 #
-# Derived from <http://code.google.com/p/mirrorrr> by Brett Slatkin
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 3
+# of the License, or (at your option) any later version.
 #
-# Modified for use with Lantern <http://www.getlantern.org> by
-# Brave New Software <http://www.bravenewsoftware.org>
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
 #
-# Modifications are copyright 2011 Brave New Software and are licensed
-# under the same license as the original work.
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor,
+# Boston, MA  02110-1301
+# USA
 #
-# Original copyright notice:
+# Mirrorrr
+# --------
 #
 # Copyright 2008 Brett Slatkin
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
