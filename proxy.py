@@ -77,14 +77,14 @@ RANGE_METHODS = frozenset(('get',))
 PAYLOAD_METHODS = frozenset(('put', 'post'))
 
 # http://code.google.com/appengine/docs/python/urlfetch/overview.html#Quotas_and_Limits
-URLFETCH_REQ_MAXBYTES = 1024 * 1024 # 1MB
+URLFETCH_REQ_MAXBYTES = 1024 * 1024 * 5 # 5MB
 URLFETCH_RES_MAXBYTES = 1024 * 1024 * 32
 # http://code.google.com/appengine/docs/python/urlfetch/fetchfunction.html
-URLFETCH_REQ_MAXSECS = 10
+URLFETCH_REQ_MAXSECS = 60
 # http://code.google.com/appengine/docs/python/runtime.html#Quotas_and_Limits
 GAE_REQ_MAXBYTES = 1024 * 1024 * 32
 GAE_RES_MAXBYTES = 1024 * 1024 * 32
-GAE_REQ_MAXSECS = 30
+GAE_REQ_MAXSECS = 60
 
 RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
 
@@ -375,12 +375,8 @@ app = webapp.WSGIApplication((
     ), debug=DEV)
 
 def main():
-    if DEV:
-        from wsgiref.handlers import CGIHandler
-        CGIHandler().run(app)
-    else:
-        from google.appengine.ext.webapp.util import run_wsgi_app
-        run_wsgi_app(app)
+    from google.appengine.ext.webapp.util import run_wsgi_app
+    run_wsgi_app(app)
 
 if __name__ == "__main__":
     main()
