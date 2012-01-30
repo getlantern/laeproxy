@@ -279,6 +279,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                     # and we have no Content-Range header from upstream, so we
                     # don't know the content length of the untruncated content
                     # and therefore can't populate Content-Range ourselves.
+                    # XXX https://github.com/getlantern/laeproxy/issues/5
                     if not rangeadded and not trunc:
                         logger.debug('Converting 200 response to 206')
                         total = contentlen
@@ -366,7 +367,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                 res.headers[EIGEN_HEADER_KEY] = MISSED_DEADLINE_GAE
         wrapper.func_name = handler.func_name
         return wrapper
-                
+
     for method in METHODS:
         locals()[method] = catch_deadline_exceeded(make_handler(method))
 
