@@ -240,16 +240,9 @@ class LaeproxyHandler(webapp.RequestHandler):
             logger.debug('urlfetch response headers: %r' % fheaders)
 
             # strip hop-by-hop headers
-            ignoreheaders = HOPBYHOP | set(i.strip() for i in
-                fheaders.get('connection', '').lower().split(',') if i.strip())
-            ignored = []
-            for k, v in fheaders.iteritems():
-                if k.lower() not in ignoreheaders:
-                    resheaders[k] = v
-                else:
-                    ignored.append(k)
-            if ignored:
-                logger.debug('Ignored response headers: %r' % ignored)
+            ignoreheaders = set(i.strip() for i in
+                fheaders.get('connection', '').lower().split(',') if i.strip()) \
+                | HOPBYHOP
 
             status = fetched.status_code
             res.set_status(status)
@@ -317,9 +310,9 @@ class LaeproxyHandler(webapp.RequestHandler):
                     # if we added the Range header, it's against the HTTP spec
                     # to send 206 downstream, so change to 200
                     if rangeadded:
-                        logger.debug('Changing 206 to 200')
+                        logger.debug('Changing 206 to 200 and stripping content-range')
                         res.set_status(200)
-                        fheaders.pop('content-range', '')
+                        ignoreheaders.add('content-range')
                     try:
                         assert crange.startswith('bytes '), 'Content-Range only supported in bytes'
                         sent, total = crange[6:].split('/', 1)
@@ -338,7 +331,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                 content = content[:RANGE_REQ_SIZE]
                 resheaders[TRUNC_HEADER_KEY] = 'True'
 
-            finalcontentlen = len(content) # could have been sliced above
+            finalcontentlen = len(content) # could have been sliced further
             # adjust content-range for truncation if necessary
             if res.status == 206:
                 try:
@@ -350,6 +343,16 @@ class LaeproxyHandler(webapp.RequestHandler):
                 except Exception, e:
                     log.error('Error adjusting Content-Range for truncation: %r' % e)
                     logger.debug(format_exc())
+
+            # copy non-ignored headers from urlfetched response
+            ignored = []
+            for k, v in fheaders.iteritems():
+                if k.lower() not in ignoreheaders:
+                    resheaders[k] = v
+                else:
+                    ignored.append(k)
+            if ignored:
+                logger.debug('Stripped response headers: %r' % ignored)
 
             logger.debug('final response headers: %r' % resheaders)
             res.out.write(content)
