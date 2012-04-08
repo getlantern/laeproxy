@@ -49,8 +49,13 @@ from urllib import unquote
 from google.appengine.api import urlfetch
 from google.appengine.ext import webapp
 from google.appengine.runtime import DeadlineExceededError
+from google.appengine.runtime.apiproxy_errors import OverQuotaError
 
 import logging
+
+fetch = urlfetch.fetch
+DownloadError = urlfetch.DownloadError
+InvalidURLError = urlfetch.InvalidURLError
 
 now = datetime.utcnow
 logger = logging.getLogger('laeproxy')
@@ -104,6 +109,7 @@ IGNORED_RECURSIVE = 'Ignored recursive request'
 REQ_TOO_LARGE = 'Request size exceeds urlfetch limit'
 MISSED_DEADLINE_URLFETCH = 'Missed urlfetch deadline'
 MISSED_DEADLINE_GAE = 'Missed GAE deadline'
+EXCEEDED_URLFETCH_QUOTA = 'Exceeded urlfetch quota'
 UNEXPECTED_ERROR = 'Unexpected error: %r'
 
 # remove hop-by-hop headers
@@ -215,7 +221,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
 
             try:
-                fetched = urlfetch.fetch(url,
+                fetched = fetch(url,
                     payload=payload,
                     method=method,
                     headers=reqheaders,
@@ -225,11 +231,17 @@ class LaeproxyHandler(webapp.RequestHandler):
                     validate_certificate=True,
                     )
                 resheaders[EIGEN_HEADER_KEY] = RETRIEVED_FROM_NET % now()
-            except urlfetch.InvalidURLError:
+            except InvalidURLError:
+                logger.debug('InvalidURLError: %s' % url)
                 return self.error(404)
-            except urlfetch.DownloadError:
+            except DownloadError:
+                logger.warn(MISSED_DEADLINE_URLFETCH)
                 resheaders[EIGEN_HEADER_KEY] = MISSED_DEADLINE_URLFETCH
                 return self.error(504)
+            except OverQuotaError:
+                logger.warn(EXCEEDED_URLFETCH_QUOTA)
+                res.headers[EIGEN_HEADER_KEY] = EXCEEDED_URLFETCH_QUOTA
+                return self.error(503)
             except Exception, e:
                 logger.error('Unexpected error: %r' % e)
                 logger.debug(format_exc())
