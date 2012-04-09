@@ -199,10 +199,12 @@ class LaeproxyHandler(webapp.RequestHandler):
                     rangestr = reqheaders['range']
                     if nbytesrequested:
                         logger.debug('Range specified upstream: %s (%d bytes)' % (rangestr, nbytesrequested))
-                        if nbytesrequested > RANGE_REQ_SIZE:
+                        if nbytesrequested > GAE_RES_MAXBYTES:
                             logger.warn('Upstream range request size exceeds App Engine response size limit')
+                            # XXX handle this better?
                     else:
                         logger.debug('Range specified upstream: %s (could not determine length)' % rangestr)
+                        # XXX handle this better?
 
             # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
             # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
