@@ -192,7 +192,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                         singlerange = True
                         start, end = ranges[0]
                         if end is not None:
-                            end += 1 # webob uses uninclusive end
+                            end -= 1 # webob uses uninclusive end
                             nbytesrequested = end - start + 1
                         elif start < 0:
                             nbytesrequested = -start
