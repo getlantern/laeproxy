@@ -284,7 +284,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                                 start += contentlen
                                 end = contentlen - 1
                                 logger.debug('Adjusted (start, end): (%d, %d)' % (start, end))
-                            needslice = contentlen != nbytesrequested
+                            needslice = contentlen > nbytesrequested
                         elif singlerange:
                             assert end is None, 'Expected upstream range request of the form "x-"'
                             end = contentlen - 1
