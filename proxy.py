@@ -64,19 +64,6 @@ logger.setLevel(logging.DEBUG)
 PROD = environ.get('SERVER_SOFTWARE', '').startswith('Google App Engine')
 DEV = not PROD
 
-if DEV:
-    def _breakpoint():
-        import sys, pdb
-        def swap():
-            for i in ('stdin', 'stdout', 'stderr'):
-                i_ = '__%s__' % i
-                tmp = getattr(sys, i)
-                setattr(sys, i, getattr(sys, i_))
-                setattr(sys, i_, tmp)
-        swap()
-        pdb.set_trace()
-        swap()
-
 METHODS = frozenset(('delete', 'get', 'head', 'put', 'post'))
 RANGE_METHODS = frozenset(('get',))
 PAYLOAD_METHODS = frozenset(('put', 'post'))
