@@ -78,7 +78,7 @@ GAE_REQ_MAXBYTES = 1024 * 1024 * 32
 GAE_RES_MAXBYTES = 1024 * 1024 * 32
 GAE_REQ_MAXSECS = 60
 
-RANGE_REQ_SIZE = GAE_RES_MAXBYTES - 2048 # wiggle room?
+RANGE_REQ_SIZE = 2000000
 
 # stamp our responses with this header
 EIGEN_HEADER_KEY = 'X-laeproxy'
