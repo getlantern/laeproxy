@@ -5,8 +5,6 @@ Standing docstring conventions:
     freelolcats.org: the blacklisted web server at the open internet.
 """
 
-import sys
-
 import gaedriver
 import requests
 import unittest2
@@ -27,17 +25,30 @@ test_online = False
 
 
 class MockServer(object):
+    """
+    You call this server like this:
+        http://localhost:<LAEPROXY_PORT>/http/localhost:<MOCKSERVER_PORT>/<command>[/<args>...][?<kwarg1>=<kwval1>[&<kwarg2>=<kwval2>]...]
+    
+    The requests are dispatched to procedures like
+        self._handle_<command>(request, response, *<args>)
+    Such handlers are expected to update the response as appropriate.
+    """
     def __call__(self, environ, start_response):
         req = Request(environ)
-        size = req.GET.get('size')
-        if size is None:
-            body = 'hello'
-        else:
-            print "Sending", size, "bytes!"
-            body = "X" * int(size)
-        resp = Response(body)
-        return resp(environ, start_response)
+        path = req.path.split('/')
+        assert path[1] and not path[0]
+        res = Response()
+        getattr(self, "_handle_" + path[1])(req, res, *path[2:])
+        return res(environ, start_response)
 
+    def _handle_size(self, req, res, size_str):
+        "Return an arbitrary string of the requested size."
+        res.text = u"X" * int(size_str)
+
+    def _handle_echo(self, req, res, *what):
+        "Return the string that makes the rest of the path."
+        res.text = u"/".join(map(unicode, what))
+       
 def start_server():
     httpd = make_server('localhost', MOCKSERVER_PORT, MockServer())
     httpd.serve_forever()
@@ -81,12 +92,14 @@ class AppTest(unittest2.TestCase):
             res_proxied = requests.get(url_proxied)
             self.assertEquals(res_direct.text, res_proxied.text)
 
-    def test_mock_server(self):
+    def test_echo(self):
         """
         Minimum test that exercises the mock server.
         """
-        res = requests.get("%secho?what=hello" % self.mock_root)
+        res = requests.get("%secho/hello" % self.mock_root)
         self.assertEquals(res.text, 'hello')
+        res = requests.get("%secho/world" % self.mock_root)
+        self.assertEquals(res.text, 'world')
 
     def test_just_below_lae_response_limit(self):
         """
@@ -128,7 +141,7 @@ class AppTest(unittest2.TestCase):
         "Utility."
         if range_end is None:
             range_end = range_start + size - 1
-        url = "%s?size=%d" % (self.mock_root, size)
+        url = "%ssize/%d" % (self.mock_root, size)
         return requests.get(url, headers={'Range': 'bytes=%s-%s' % (range_start, range_end)})
 
 if __name__ == '__main__':
