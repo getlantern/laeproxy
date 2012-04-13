@@ -2,8 +2,8 @@ import gaedriver
 import requests
 import unittest2
 from multiprocessing import Process
+from webob import Request, Response
 from wsgiref.simple_server import make_server
-from wsgiref.util import setup_testing_defaults
 
 TEST_CONFIG_FILE = './gaedriver.conf'
 GAEDRIVER_APP_TOKEN = None
@@ -11,15 +11,14 @@ GAEDRIVER_APP_TOKEN = None
 MOCKSERVER_PORT = 5678
 mockserver_proc = None
 
-def simple_app(environ, start_response):
-    setup_testing_defaults(environ)
-    status = '200 OK'
-    headers = [('Content-type', 'text/plain')]
-    start_response(status, headers)
-    return ['hello']
+class MockServer(object):
+    def __call__(self, environ, start_response):
+        req = Request(environ)
+        resp = Response('hello')
+        return resp(environ, start_response)
 
 def start_server():
-    httpd = make_server('localhost', MOCKSERVER_PORT, simple_app)
+    httpd = make_server('localhost', MOCKSERVER_PORT, MockServer())
     httpd.serve_forever()
 
 def setUpModule():
