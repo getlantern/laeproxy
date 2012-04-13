@@ -308,14 +308,14 @@ class LaeproxyHandler(webapp.RequestHandler):
                 content = content[urange_start:urange_end+1] # XXX cache discarded content for subsequent requests before throwing away if cache policy allows
                 crangestr = 'bytes %d-%d/%d' % (urange_start, urange_end, contentlen)
                 resheaders['content-range'] = crangestr
-                logger.debug('Sending Content-Range: %s' % crangestr
+                logger.debug('Sending Content-Range: %s' % crangestr)
                 return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
             elif status == 206:
                 resheaders[UPSTREAM_206] = 'True'
                 crange = fheaders.get('content-range', '')
                 resheaders[UPSTREAM_CONTENT_RANGE] = crange
-                logger.debug('Upstream Content-Range: %s', % crange)
+                logger.debug('Upstream Content-Range: %s' % crange)
                 try:
                     assert crange.startswith('bytes '), 'Content-Range only supported in bytes'
                     sent, total = crange[6:].split('/', 1)
