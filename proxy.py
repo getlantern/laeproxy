@@ -76,9 +76,10 @@ URLFETCH_REQ_MAXSECS = 60
 # http://code.google.com/appengine/docs/python/runtime.html#Quotas_and_Limits
 GAE_REQ_MAXBYTES = 1024 * 1024 * 32
 GAE_RES_MAXBYTES = 1024 * 1024 * 32
+RES_MAXBYTES = 1024 * 1024 * 7 # max urlfetch bandwidth of 22MB/sec
 GAE_REQ_MAXSECS = 60
 
-RANGE_REQ_SIZE = 2000000
+RANGE_REQ_SIZE = 2000000 # bytes. matches Lantern's CHUNK_SIZE.
 
 # stamp our responses with this header
 EIGEN_HEADER_KEY = 'X-laeproxy'
@@ -112,7 +113,25 @@ HOPBYHOP = frozenset((
     'upgrade',
     ))
 
+def copy_headers(from_, to, ignore=set()):
+    ignored = []
+    for k, v in from_.iteritems():
+        if k.lower() not in ignore:
+            to[k] = v
+        else:
+            ignored.append((k, v))
+    return ignored
+
 class LaeproxyHandler(webapp.RequestHandler):
+
+    def _send_response(self, fheaders, resheaders, ignoreheaders, content, error=None):
+        ignored = copy_headers(fheaders, resheaders, ignoreheaders)
+        if ignored:
+            logger.debug('Stripped response headers: %r' % ignored)
+        logger.debug('final response headers: %r' % resheaders)
+        self.response.out.write(content)
+        if error:
+            return self.error(error)
 
     def make_handler(method):
         assert method in METHODS, 'unsupported method: %s' % method
@@ -151,14 +170,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             payloadlen = len(payload) if payload else 0
             if payloadlen >= URLFETCH_REQ_MAXBYTES:
                 resheaders[EIGEN_HEADER_KEY] = REQ_TOO_LARGE
-                return self.error(413)
-
-            # XXX http://code.google.com/p/googleappengine/issues/detail?id=4879
-            if 'content-length' not in reqheaders:
-                logger.debug('Adding Content-Length: %d' % payloadlen)
-                reqheaders['content-length'] = str(payloadlen)
-            # even this triggers KeyError('Content-Length') without the above:
-            logger.debug('Request headers: %r' % reqheaders)
+                return self.error(503)
 
             # strip hop-by-hop headers
             ignoreheaders = HOPBYHOP | set(i.strip() for i in
@@ -168,43 +180,62 @@ class LaeproxyHandler(webapp.RequestHandler):
                 if i in reqheaders:
                     ignored.append(reqheaders.pop(i))
             if ignored:
-                logger.debug('Ignored request headers: %r' % ignored)
+                logger.debug('Stripped request headers: %r' % ignored)
 
             if rangemethod:
-                # add Range header to avoid hitting app engine limits
-                if not req.range:
-                    unparsed_range = reqheaders.get('range')
-                    if unparsed_range:
-                        logger.debug('Could not parse Range specified upstream ("%s"), overwriting' % unparsed_range)
-                    rangeadded = True # we are adding the range header
-                    start = 0
-                    end = RANGE_REQ_SIZE - 1
-                    nbytesrequested = end - start + 1 # endpoints are inclusive
-                    rangestr = 'bytes=%d-%d' % (start, end)
-                    reqheaders['range'] = rangestr
-                    logger.debug('Added Range: %s' % rangestr)
-                else:
-                    rangeadded = False # Range header already present
-                    singlerange = False # only a single range given
-                    nbytesrequested = None # will be calculated if possible
-                    ranges = req.range.ranges
-                    if len(ranges) == 1:
-                        singlerange = True
-                        start, end = ranges[0]
-                        if end is not None:
-                            end -= 1 # webob uses uninclusive end
-                            nbytesrequested = end - start + 1
-                        elif start < 0:
-                            nbytesrequested = -start
-                    rangestr = reqheaders['range']
-                    if nbytesrequested:
-                        logger.debug('Range specified upstream: %s (%d bytes)' % (rangestr, nbytesrequested))
-                        if nbytesrequested > GAE_RES_MAXBYTES:
-                            logger.warn('Upstream range request size exceeds App Engine response size limit')
-                            # XXX handle this better?
+                urange = reqheaders.get('range') # upstream range
+                logger.debug('Range specified upstream: %s' % urange)
+                urange_kept = None
+                urange_nbytesrequested = None
+                urange_openended = False # open-ended range request (of the form bytes=x-)
+                urange_start = urange_end = None # start and end bytes of upstream range header
+                srange_start = srange_end = None # start and end bytes of sent range header
+                srange_nbytesrequested = None
+                if req.range:
+                    ranges = req.range.ranges # removed in webob 1.2b1 (http://docs.webob.org/en/latest/news.html) but app engine python 2.7 runtime uses webob 1.1.1
+                    singlerange = len(ranges) == 1 # only a single range given
+                    if singlerange:
+                        urange_start, urange_end = ranges[0]
+                        if urange_end is not None: # range request of the form bytes=x-y
+                            urange_end -= 1 # webob uses uninclusive end
+                            urange_nbytesrequested = urange_end - urange_start + 1
+                        elif urange_start < 0: # range request of the form bytes=-x
+                            urange_nbytesrequested = -urange_start
+                        else: # open-ended range request of the form bytes=x-
+                            urange_openended = True
+
+                        if urange_openended:
+                            srange_start = urange_start
+                            srange_end = urange_start + RES_MAXBYTES - 1
+                            srange_nbytesrequested = RES_MAXBYTES
+                            rangestr = 'bytes=%d-%d' % (srange_start, srange_end)
+                            reqheaders['range'] = rangestr
+                            logger.warn('Optimistically capping open-ended upstream range, sending range: %s' % rangestr)
+                            urange_kept = False
+                        elif urange_nbytesrequested > RES_MAXBYTES:
+                            logger.warn('Upstream request requested %d bytes, limit is %d, returning 503' % (urange_nbytesrequested, RES_MAXBYTES))
+                            return self.error(503)
+                        else:
+                            srange_start = urange_start
+                            srange_end = urange_end
+                            srange_nbytesrequested = urange_nbytesrequested
+                            urange_kept = True
                     else:
-                        logger.debug('Range specified upstream: %s (could not determine length)' % rangestr)
-                        # XXX handle this better?
+                        logger.warn('Cannot fulfill request for multiple ranges, returning 503')
+                        return self.error(503)
+
+                if not req.range:
+                    if urange:
+                        logger.warn('Could not parse range specified upstream, overwriting')
+                        urange = None
+                    srange_start = 0
+                    srange_end = RANGE_REQ_SIZE - 1
+                    srange_nbytesrequested = RANGE_REQ_SIZE
+                    rangestr = 'bytes=%d-%d' % (srange_start, srange_end)
+                    reqheaders['range'] = rangestr
+                    logger.debug('Sending range: %s' % rangestr)
+                    urange_kept = False
+
 
             # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
             # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
@@ -252,111 +283,88 @@ class LaeproxyHandler(webapp.RequestHandler):
 
             trunc = fetched.content_was_truncated
             if trunc:
-                logger.warn('urlfetch returned truncated content')
+                logger.warn('urlfetch returned truncated response, returning as-is, originator should verify')
+                resheaders[TRUNC_HEADER_KEY] = 'True'
+                return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-            if rangemethod:
-                if status == 200:
-                    logger.debug('Got 200 response to range request')
-                    resheaders[UPSTREAM_206] = 'False'
+            if not rangemethod:
+                logger.debug('Non-range method, returning response as-is')
+                return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-                    # If we added the Range header and got back a 200, just
-                    # send back the response as-is. The upstream requester
-                    # isn't expecting a 206 in this case.
+            if status == 200:
+                resheaders[UPSTREAM_206] = 'False'
+                # If we set the Range header and got back a 200, just
+                # send back the response as-is.
+                if not urange_kept:
+                    logger.warn('Upstream range (if any) not kept and got 200 response, returning as-is')
+                    return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-                    # If the Range header was already present and we got back
-                    # a 200, change to 206 (slicing content accordingly)
-                    # to comply with the last paragraph (re proxies) of
-                    # http://tools.ietf.org/html/rfc2616#section-14.35.2
-                    # Note: We can only do this for untruncated urlfetch
-                    # results, since urlfetch overwrites Content-Length
-                    # (http://code.google.com/p/googleappengine/issues/detail?id=4878)
-                    # and we have no Content-Range header from upstream, so we
-                    # don't know the content length of the untruncated content
-                    # and therefore can't populate Content-Range ourselves.
-                    # XXX https://github.com/getlantern/laeproxy/issues/5
-                    if not rangeadded and not trunc:
-                        logger.debug('Converting 200 response to 206')
-                        total = contentlen
-                        needslice = False
-                        if nbytesrequested:
-                            if end is None:
-                                # since the length of the requested range is
-                                # known, it must be of the form "-x"
-                                assert start < 0, 'Expected upstream range request of the form "-x"'
-                                start += contentlen
-                                end = contentlen - 1
-                                logger.debug('Adjusted (start, end): (%d, %d)' % (start, end))
-                            needslice = contentlen > nbytesrequested
-                        elif singlerange:
-                            assert end is None, 'Expected upstream range request of the form "x-"'
-                            end = contentlen - 1
-                            logger.debug('Populated end: %d' % end)
-                            if start > end:
-                                logger.debug('Requested start position is beyond end position, not satisfiable')
-                                resheaders['content-range'] = 'bytes */%d' % total
-                                return self.error(416)
-                            needslice = start != 0
-                        if needslice:
-                            logger.debug('Slicing content [%d:%d]' % (start, end+1))
-                            # XXX cache discarded content for subsequent requests if cache policy allows
-                            content = content[start:end+1]
-                        res.set_status(206)
-                        resheaders['content-range'] = 'bytes %d-%d/%d' % (start, end, total)
-                        logger.debug('Sending Content-Range: %d-%d/%d' % (start, end, total))
+                # If we kept the upstream Range header and we got back
+                # a 200, change to 206 and slice content accordingly (see
+                # http://tools.ietf.org/html/rfc2616#section-14.35.2
+                # last paragraph (re proxies))
+                logger.debug('Upstream range kept and got 200 response, slicing and converting to 206')
+                res.set_status(206)
+                content = content[urange_start:urange_end+1] # XXX cache discarded content for subsequent requests before throwing away if cache policy allows
+                crangestr = 'bytes %d-%d/%d' % (urange_start, urange_end, contentlen)
+                resheaders['content-range'] = crangestr
+                logger.debug('Sending Content-Range: %s' % crangestr
+                return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-                elif status == 206:
-                    resheaders[UPSTREAM_206] = 'True'
-                    crange = fheaders.get('content-range', '')
-                    resheaders[UPSTREAM_CONTENT_RANGE] = crange
-                    # if we added the Range header, it's against the HTTP spec
-                    # to send 206 downstream, so change to 200
-                    if rangeadded:
-                        logger.debug('Changing 206 to 200 and stripping content-range')
+            elif status == 206:
+                resheaders[UPSTREAM_206] = 'True'
+                crange = fheaders.get('content-range', '')
+                resheaders[UPSTREAM_CONTENT_RANGE] = crange
+                logger.debug('Upstream Content-Range: %s', % crange)
+                try:
+                    assert crange.startswith('bytes '), 'Content-Range only supported in bytes'
+                    sent, total = crange[6:].split('/', 1)
+                    start, end = [int(i) for i in sent.split('-', 1)]
+                    total = int(total)
+                except Exception, e:
+                    logger.warn('Error parsing upstream Content-Range %r: %r, returning 206 response as-is' % (crange, e))
+                    logger.debug(format_exc())
+                    return self._send_response(fheaders, resheaders, ignoreheaders, content)
+
+                logger.debug('Parsed Content-Range: %d-%d/%d' % (start, end, total))
+                entire = start == 0 and end == total - 1
+
+                # If we *added* the range header and got back 206...
+                if not urange:
+                    # it's against the spec to send 206 downstream, so convert to 200 response
+                    if entire: # can only send 200 if we have the entire entity
+                        logger.debug('Got entire entity, converting to 200 response to fulfill non-range request')
                         res.set_status(200)
                         ignoreheaders.add('content-range')
-                    try:
-                        assert crange.startswith('bytes '), 'Content-Range only supported in bytes'
-                        sent, total = crange[6:].split('/', 1)
-                        start, end = [int(i) for i in sent.split('-', 1)]
-                        total = int(total)
-                    except Exception, e:
-                        logger.info('Error parsing Content-Range %r: %r' % (crange, e))
-                        logger.debug(format_exc())
-                    else:
-                        logger.debug('Parsed Content-Range: %d-%d/%d' % (start, end, total))
+                        return self._send_response(fheaders, resheaders, ignoreheaders, content)
+                    logger.warn('Did not get entire entity so cannot fulfill non-range request, returning 503')
+                    return self._send_response(fheaders, resheaders, ignoreheaders, content, error=503)
 
-            finalcontentlen = len(content) # could have been sliced above
-            if finalcontentlen > RANGE_REQ_SIZE:
-                diff = finalcontentlen - RANGE_REQ_SIZE
-                logger.info('Content is %d bytes, max is %d. Truncating %d bytes.' % (finalcontentlen, RANGE_REQ_SIZE, diff))
-                content = content[:RANGE_REQ_SIZE]
-                resheaders[TRUNC_HEADER_KEY] = 'True'
+                # If we kept the upstream range header and got back 206...
+                if urange_kept:
+                    # check if the 206 actually fulfills it
+                    if start == urange_start and total <= urange_nbytesrequested: # could have requested more than there is
+                        logger.debug('Upstream 206 response fulfills upstream range request, returning as-is')
+                        return self._send_response(fheaders, resheaders, ignoreheaders, content)
+                    logger.warn('Upstream Content-Range "%s" does not fulfill range requested upstream "%s"' % (crange, urange))
+                    logger.warn('Returning upstream 206 response as-is, originator should verify')
+                    return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-            finalcontentlen = len(content) # could have been sliced further
-            # adjust content-range for truncation if necessary
-            if res.status == 206:
-                try:
-                    realend = start + finalcontentlen - 1
-                    if end != realend:
-                        crange = 'bytes %d-%d/%d' % (start, realend, total)
-                        resheaders['content-range'] = crange
-                        logger.debug('Changed "end" from %d to %d. Sending Content-Range: %s' % (end, realend, crange))
-                except Exception, e:
-                    log.error('Error adjusting Content-Range for truncation: %r' % e)
-                    logger.debug(format_exc())
+                # If the upstream range request was open-ended (e.g. bytes=x-),
+                # we capped it (e.g. bytes=x-y) hoping to still retrieve the
+                # whole rest of the entity
+                if urange_openended:
+                    assert not urange_kept, 'Expected to have modified range header from upstream to not be open-ended'
+                    if end != total - 1:
+                        logger.warn('Could only request last %d bytes of entity but %d bytes are required to fulfill open-ended upstream range request, returning 503' % (srange_nbytesrequested, total - end))
+                        return self._send_response(fheaders, resheaders, ignoreheaders, content, error=503)
+                    logger.debug('Upstream 206 response fulfills open-ended upstream range request, returning as-is')
+                    return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-            # copy non-ignored headers from urlfetched response
-            ignored = []
-            for k, v in fheaders.iteritems():
-                if k.lower() not in ignoreheaders:
-                    resheaders[k] = v
-                else:
-                    ignored.append(k)
-            if ignored:
-                logger.debug('Stripped response headers: %r' % ignored)
+                # should never get here
+                logger.error('Reached unexpected code path')
+                return self._send_response(fheaders, resheaders, ignoreheaders, content, error=500)
 
-            logger.debug('final response headers: %r' % resheaders)
-            res.out.write(content)
 
         handler.func_name = method
         return handler
