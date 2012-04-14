@@ -76,7 +76,6 @@ URLFETCH_REQ_MAXSECS = 60
 # http://code.google.com/appengine/docs/python/runtime.html#Quotas_and_Limits
 GAE_REQ_MAXBYTES = 1024 * 1024 * 32
 GAE_RES_MAXBYTES = 1024 * 1024 * 32
-RES_MAXBYTES = 1024 * 1024 * 7 # max urlfetch bandwidth of 22MB/sec
 GAE_REQ_MAXSECS = 60
 
 RANGE_REQ_SIZE = 2000000 # bytes. matches Lantern's CHUNK_SIZE.
@@ -124,6 +123,30 @@ def copy_headers(from_, to, ignore=set()):
 
 class LaeproxyHandler(webapp.RequestHandler):
 
+    def _extract_url(self, req):
+        # reconstruct original url
+        path = req.path_qs.lstrip('/')
+        try:
+            scheme, rest = path.split('/', 1)
+            parts = rest.split('/', 1)
+        except ValueError:
+            self.abort(404)
+        try:
+            rest = parts[1]
+        except IndexError:
+            rest = ''
+        host = unquote(parts[0])
+        if not host:
+            logger.debug('No host specified, sending 404')
+            self.abort(404)
+        if req.host.lower() == host.lower():
+            logger.info('Ignoring recursive request %s' % req.url)
+            self.response.headers[EIGEN_HEADER_KEY] = IGNORED_RECURSIVE
+            self.abort(404)
+        url = scheme + '://' + host + '/' + rest
+        logger.debug('Target url: %s' % url)
+        return url
+
     def _send_response(self, fheaders, resheaders, ignoreheaders, content, error=None):
         ignored = copy_headers(fheaders, resheaders, ignoreheaders)
         if ignored:
@@ -131,7 +154,7 @@ class LaeproxyHandler(webapp.RequestHandler):
         logger.debug('final response headers: %r' % resheaders)
         self.response.out.write(content)
         if error:
-            return self.error(error)
+            self.abort(error)
 
     def make_handler(method):
         assert method in METHODS, 'unsupported method: %s' % method
@@ -144,37 +167,20 @@ class LaeproxyHandler(webapp.RequestHandler):
             reqheaders = req.headers
             resheaders = res.headers
 
-            # reconstruct original url
-            path = req.path_qs.lstrip('/')
-            try:
-                scheme, rest = path.split('/', 1)
-                parts = rest.split('/', 1)
-            except ValueError:
-                return self.error(404)
-            try:
-                rest = parts[1]
-            except IndexError:
-                rest = ''
-            host = unquote(parts[0])
-            if not host:
-                return self.error(404)
-            if req.host.lower() == host.lower():
-                logger.info('Ignoring recursive request %s' % req.url)
-                resheaders[EIGEN_HEADER_KEY] = IGNORED_RECURSIVE
-                return self.error(404)
-            url = scheme + '://' + host + '/' + rest
-            logger.debug('Target url: %s' % url)
+            url = self._extract_url(req)
 
             # check payload
             payload = req.body if payloadmethod else None
             payloadlen = len(payload) if payload else 0
             if payloadlen >= URLFETCH_REQ_MAXBYTES:
                 resheaders[EIGEN_HEADER_KEY] = REQ_TOO_LARGE
-                return self.error(503)
+                self.abort(503)
 
             # strip hop-by-hop headers
-            ignoreheaders = HOPBYHOP | set(i.strip() for i in
-                reqheaders.get('connection', '').lower().split(',') if i.strip())
+            ignoreheaders = set(i.strip() for i in
+                reqheaders.get('connection', '').lower().split(',') if i.strip()) \
+                | HOPBYHOP 
+            ignoreheaders.add('host')
             ignored = []
             for i in ignoreheaders:
                 if i in reqheaders:
@@ -183,59 +189,26 @@ class LaeproxyHandler(webapp.RequestHandler):
                 logger.debug('Stripped request headers: %r' % ignored)
 
             if rangemethod:
-                urange = reqheaders.get('range') # upstream range
-                logger.debug('Range specified upstream: %s' % urange)
-                urange_kept = None
-                urange_nbytesrequested = None
-                urange_openended = False # open-ended range request (of the form bytes=x-)
-                urange_start = urange_end = None # start and end bytes of upstream range header
-                srange_start = srange_end = None # start and end bytes of sent range header
-                srange_nbytesrequested = None
-                if req.range:
-                    ranges = req.range.ranges # removed in webob 1.2b1 (http://docs.webob.org/en/latest/news.html) but app engine python 2.7 runtime uses webob 1.1.1
-                    singlerange = len(ranges) == 1 # only a single range given
-                    if singlerange:
-                        urange_start, urange_end = ranges[0]
-                        if urange_end is not None: # range request of the form bytes=x-y
-                            urange_end -= 1 # webob uses uninclusive end
-                            urange_nbytesrequested = urange_end - urange_start + 1
-                        elif urange_start < 0: # range request of the form bytes=-x
-                            urange_nbytesrequested = -urange_start
-                        else: # open-ended range request of the form bytes=x-
-                            urange_openended = True
-
-                        if urange_openended:
-                            srange_start = urange_start
-                            srange_end = urange_start + RES_MAXBYTES - 1
-                            srange_nbytesrequested = RES_MAXBYTES
-                            rangestr = 'bytes=%d-%d' % (srange_start, srange_end)
-                            reqheaders['range'] = rangestr
-                            logger.warn('Optimistically capping open-ended upstream range, sending range: %s' % rangestr)
-                            urange_kept = False
-                        elif urange_nbytesrequested > RES_MAXBYTES:
-                            logger.warn('Upstream request requested %d bytes, limit is %d, returning 503' % (urange_nbytesrequested, RES_MAXBYTES))
-                            return self.error(503)
-                        else:
-                            srange_start = urange_start
-                            srange_end = urange_end
-                            srange_nbytesrequested = urange_nbytesrequested
-                            urange_kept = True
-                    else:
-                        logger.warn('Cannot fulfill request for multiple ranges, returning 503')
-                        return self.error(503)
-
                 if not req.range:
-                    if urange:
-                        logger.warn('Could not parse range specified upstream, overwriting')
-                        urange = None
-                    srange_start = 0
-                    srange_end = RANGE_REQ_SIZE - 1
-                    srange_nbytesrequested = RANGE_REQ_SIZE
-                    rangestr = 'bytes=%d-%d' % (srange_start, srange_end)
-                    reqheaders['range'] = rangestr
-                    logger.debug('Sending range: %s' % rangestr)
-                    urange_kept = False
-
+                    logger.debug('No upstream range header')
+                    self.abort(400)
+                ranges = req.range.ranges # removed in webob 1.2b1 (http://docs.webob.org/en/latest/news.html) but app engine python 2.7 runtime uses webob 1.1.1
+                if len(ranges) != 1:
+                    logger.debug('Expected a single range header')
+                    self.abort(400)
+                range_start, range_end = ranges[0]
+                if range_end is None:
+                    logger.debug('Expected range header of the form bytes=x-y')
+                    self.abort(400)
+                range_end -= 1 # webob uses uninclusive end
+                assert range_start is not None, 'Expected range header of the form bytes=x-y'
+                if not (0 <= range_start <= range_end):
+                    logger.debug('Expected 0 <= range_start <= range_end')
+                    self.abort(400)
+                nbytes_requested = range_end - range_start + 1
+                if nbytes_requested > RANGE_REQ_SIZE:
+                    logger.warn('Upstream request requested %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE))
+                    self.abort(503)
 
             # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
             # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
@@ -253,20 +226,20 @@ class LaeproxyHandler(webapp.RequestHandler):
                 resheaders[EIGEN_HEADER_KEY] = RETRIEVED_FROM_NET % now()
             except InvalidURLError:
                 logger.debug('InvalidURLError: %s' % url)
-                return self.error(404)
+                self.abort(404)
             except DownloadError:
                 logger.warn(MISSED_DEADLINE_URLFETCH)
                 resheaders[EIGEN_HEADER_KEY] = MISSED_DEADLINE_URLFETCH
-                return self.error(504)
+                self.abort(504)
             except OverQuotaError:
                 logger.warn(EXCEEDED_URLFETCH_QUOTA)
                 res.headers[EIGEN_HEADER_KEY] = EXCEEDED_URLFETCH_QUOTA
-                return self.error(503)
+                self.abort(503)
             except Exception, e:
                 logger.error('Unexpected error: %r' % e)
                 logger.debug(format_exc())
                 resheaders[EIGEN_HEADER_KEY] = UNEXPECTED_ERROR % e
-                return self.error(500)
+                self.abort(500)
 
             fheaders = fetched.headers
             logger.debug('urlfetch response headers: %r' % fheaders)
@@ -292,26 +265,16 @@ class LaeproxyHandler(webapp.RequestHandler):
                 return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
             if status == 200:
-                resheaders[UPSTREAM_206] = 'False'
-                # If we set the Range header and got back a 200, just
-                # send back the response as-is.
-                if not urange_kept:
-                    logger.warn('Upstream range (if any) not kept and got 200 response, returning as-is')
-                    return self._send_response(fheaders, resheaders, ignoreheaders, content)
-
-                # If we kept the upstream Range header and we got back
-                # a 200, change to 206 and slice content accordingly (see
+                # Last paragraph (re proxies) of
                 # http://tools.ietf.org/html/rfc2616#section-14.35.2
-                # last paragraph (re proxies))
-                logger.debug('Upstream range kept and got 200 response, slicing and converting to 206')
-                res.set_status(206)
-                content = content[urange_start:urange_end+1] # XXX cache discarded content for subsequent requests before throwing away if cache policy allows
-                crangestr = 'bytes %d-%d/%d' % (urange_start, urange_end, contentlen)
-                resheaders['content-range'] = crangestr
-                logger.debug('Sending Content-Range: %s' % crangestr)
+                # says we SHOULD send back 206 and cache entire entity in this
+                # case. Disregarding for the sake of simplicity in the face of
+                # App Engine's peculiar environment.
+                logger.debug('Destination server does not support range requests, returning response as-is')
+                resheaders[UPSTREAM_206] = 'False'
                 return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-            elif status == 206:
+            if status == 206:
                 resheaders[UPSTREAM_206] = 'True'
                 crange = fheaders.get('content-range', '')
                 resheaders[UPSTREAM_CONTENT_RANGE] = crange
@@ -329,42 +292,16 @@ class LaeproxyHandler(webapp.RequestHandler):
                 logger.debug('Parsed Content-Range: %d-%d/%d' % (start, end, total))
                 entire = start == 0 and end == total - 1
 
-                # If we *added* the range header and got back 206...
-                if not urange:
-                    # it's against the spec to send 206 downstream, so convert to 200 response
-                    if entire: # can only send 200 if we have the entire entity
-                        logger.debug('Got entire entity, converting to 200 response to fulfill non-range request')
-                        res.set_status(200)
-                        ignoreheaders.add('content-range')
-                        return self._send_response(fheaders, resheaders, ignoreheaders, content)
-                    logger.warn('Did not get entire entity so cannot fulfill non-range request, returning 503')
-                    return self._send_response(fheaders, resheaders, ignoreheaders, content, error=503)
-
-                # If we kept the upstream range header and got back 206...
-                if urange_kept:
-                    # check if the 206 actually fulfills it
-                    if start == urange_start and total <= urange_nbytesrequested: # could have requested more than there is
-                        logger.debug('Upstream 206 response fulfills upstream range request, returning as-is')
-                        return self._send_response(fheaders, resheaders, ignoreheaders, content)
-                    logger.warn('Upstream Content-Range "%s" does not fulfill range requested upstream "%s"' % (crange, urange))
+                # check if the 206 actually fulfills it
+                if start == range_start and end <= range_end: # could have requested more than there is
+                    logger.debug('Upstream 206 response fulfills upstream range request, returning as-is')
+                else:
+                    logger.warn('Upstream Content-Range "%s" does not match range requested upstream "%s"' % (crange, reqheaders.get('range', '(no range?)')))
                     logger.warn('Returning upstream 206 response as-is, originator should verify')
-                    return self._send_response(fheaders, resheaders, ignoreheaders, content)
+                return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-                # If the upstream range request was open-ended (e.g. bytes=x-),
-                # we capped it (e.g. bytes=x-y) hoping to still retrieve the
-                # whole rest of the entity
-                if urange_openended:
-                    assert not urange_kept, 'Expected to have modified range header from upstream to not be open-ended'
-                    if end != total - 1:
-                        logger.warn('Could only request last %d bytes of entity but %d bytes are required to fulfill open-ended upstream range request, returning 503' % (srange_nbytesrequested, total - end))
-                        return self._send_response(fheaders, resheaders, ignoreheaders, content, error=503)
-                    logger.debug('Upstream 206 response fulfills open-ended upstream range request, returning as-is')
-                    return self._send_response(fheaders, resheaders, ignoreheaders, content)
-
-                # should never get here
-                logger.error('Reached unexpected code path')
-                return self._send_response(fheaders, resheaders, ignoreheaders, content, error=500)
-
+            logger.debug('Non-200 or 206 response to range request, returning response as-is')
+            return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
         handler.func_name = method
         return handler
@@ -375,8 +312,8 @@ class LaeproxyHandler(webapp.RequestHandler):
                 return handler(self, *args, **kw)
             except DeadlineExceededError:
                 res = self.response
-                res.set_status(503)
                 res.headers[EIGEN_HEADER_KEY] = MISSED_DEADLINE_GAE
+                self.abort(503)
         wrapper.func_name = handler.func_name
         return wrapper
 

@@ -46,6 +46,10 @@ def tearDownModule():
 
 class AppTest(unittest2.TestCase):
 
+    def __init__(self, *args, **kw):
+        unittest2.TestCase.__init__(self, *args, **kw)
+        self.maxDiff = None
+
     def setUp(self):
         self.config = gaedriver.load_config_from_file(TEST_CONFIG_FILE)
 
@@ -53,10 +57,10 @@ class AppTest(unittest2.TestCase):
         url_direct = 'http://www.google.com/humans.txt'
         url_proxied = 'http://%s/http/www.google.com/humans.txt' % self.config.app_hostname
         res_direct = requests.get(url_direct)
-        res_proxied = requests.get(url_proxied)
+        res_proxied = requests.get(url_proxied, headers=dict(range='bytes=0-2000000'))
         self.assertEquals(res_direct.text, res_proxied.text)
 
     def test_mock_server(self):
         url = 'http://%s/http/localhost:%d/' % (self.config.app_hostname, MOCKSERVER_PORT)
-        res = requests.get(url)
+        res = requests.get(url, headers=dict(range='bytes=0-2000000'))
         self.assertEquals(res.text, 'hello')
