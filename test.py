@@ -5,10 +5,11 @@ Standing docstring conventions:
     freelolcats.org: the blacklisted web server at the open internet.
 """
 
+from multiprocessing import Process
+
 import gaedriver
 import requests
 import unittest2
-from multiprocessing import Process
 from webob import Request, Response
 from wsgiref.simple_server import make_server
 
@@ -42,8 +43,19 @@ class MockServer(object):
         return res(environ, start_response)
 
     def _handle_size(self, req, res, size_str):
-        "Return an arbitrary string of the requested size."
-        res.text = u"X" * int(size_str)
+        """
+        Return an arbitrary string of the requested size.
+
+        Range headers will be honored unless a kwarg ignore_range=True
+        is passed in the request.
+        """
+        ignore_range = req.GET.get('ignore_range', 'False')
+        assert ignore_range in ['True', 'False']
+        if ignore_range == 'True':
+            length = int(size_str)
+        else:
+            length = req.range.end + 1 - req.range.start
+        res.text = u"X" * length
 
     def _handle_echo(self, req, res, *what):
         "Return the string that makes the rest of the path."
@@ -117,31 +129,53 @@ class AppTest(unittest2.TestCase):
         res = self._sized_request(proxy.RES_MAXBYTES + 1)
         self.assertEquals(res.status_code, 503)
 
-    def test_range_ignoring_server(self):
+    def test_range_honoring_server(self):
         """
         If the following are true of a request:
           - the file Liu requests is too big,
           - Liu provides a correct range in his request,
-          - freelolcats.org is ignoring range.
+          - freelolcats.org HONORS range.
         Then the following should happen:
           - Liu gets a 206 status code, and
-          - Liu gets the right range headers and body anyway.
+          - Liu gets the right range headers and body.
         """
+        #XXX: This test fails at this moment, because the mock server is not
+        #     sending proper content-length headers.  Now, _cover is
+        #     populating content-length in the case where freelolcats.org
+        #     ignores range requests, so should it do the same here?
+        res = self._test_range(ignore_range='False')
+        self.assertEquals(res.headers[proxy.UPSTREAM_206], 'True')
+
+    def test_range_ignoring_server(self):
+        """
+        If freelolcats.org ignores range, the consequences for Liu
+        are the same as if it was supported, with the exception that
+        a laeproxy-specific header will signal this condition.
+        """
+        res = self._test_range(ignore_range='True')
+        self.assertEquals(res.headers[proxy.UPSTREAM_206], 'False')
+
+    # Utility methods.
+
+    def _test_range(self, ignore_range):
         start = 1000
         end = 1100
         res = self._sized_request(proxy.RES_MAXBYTES + 1, 
                                   range_start=start, 
-                                  range_end=end)
+                                  range_end=end,
+                                  extra=dict(ignore_range=ignore_range))
         self.assertEquals(res.status_code, 206)
         self.assertEquals(len(res.text), end-start+1)
         self.assertEquals(res.headers['content-range'].lower(),
                           "bytes %s-%s/%s" % (start, end, proxy.RES_MAXBYTES + 1))
+        return res
 
-    def _sized_request(self, size, range_start=0, range_end=None):
-        "Utility."
+    def _sized_request(self, size, range_start=0, range_end=None, extra=None):
         if range_end is None:
             range_end = range_start + size - 1
         url = "%ssize/%d" % (self.mock_root, size)
+        if extra:
+            url += "?" + "&".join("%s=%s" % (k, v) for k, v in extra.iteritems())
         return requests.get(url, headers={'Range': 'bytes=%s-%s' % (range_start, range_end)})
 
 if __name__ == '__main__':
