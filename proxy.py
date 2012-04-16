@@ -81,20 +81,16 @@ GAE_REQ_MAXSECS = 60
 RANGE_REQ_SIZE = 2000000 # bytes. matches Lantern's CHUNK_SIZE.
 
 # stamp our responses with this header
-EIGEN_HEADER_KEY = 'X-laeproxy'
-UPSTREAM_STATUS_CODE = 'X-laeproxy-upstream-status-code'
-# indicates truncated response
-TRUNC_HEADER_KEY = 'X-laeproxy-truncated'
-# specifies full length of an entity that has been truncated
-UNTRUNC_LEN = 'X-laeproxy-untruncated-content-length'
-# upstream Content-Range moved aside to this when we have to respond with 200
-UPSTREAM_CONTENT_RANGE = 'X-laeproxy-upstream-content-range'
+H_LAEPROXY = 'X-laeproxy'
+H_TRUNCATED = 'X-laeproxy-truncated'
+H_UPSTREAM_STATUS_CODE = 'X-laeproxy-upstream-status-code'
+H_UPSTREAM_CONTENT_RANGE = 'X-laeproxy-upstream-content-range'
 # various values corresponding to possible results of proxy requests
 RETRIEVED_FROM_NET = 'Retrieved from network %s'
 IGNORED_RECURSIVE = 'Ignored recursive request'
 REQ_TOO_LARGE = 'Request size exceeds urlfetch limit'
 MISSED_DEADLINE_URLFETCH = 'Missed urlfetch deadline'
-MISSED_DEADLINE_GAE = 'Missed GAE deadline'
+MISSED_DEADLINE_GAE = ' Missed GAE deadline'
 EXCEEDED_URLFETCH_QUOTA = 'Exceeded urlfetch quota'
 UNEXPECTED_ERROR = 'Unexpected error: %r'
 
@@ -129,6 +125,8 @@ class LaeproxyHandler(webapp.RequestHandler):
             scheme, rest = path.split('/', 1)
             parts = rest.split('/', 1)
         except ValueError:
+            logger.debug('Invalid url: %s' % path)
+            self.response.headers[H_LAEPROXY] = 'Invalid url'
             self.abort(404)
         try:
             rest = parts[1]
@@ -136,11 +134,12 @@ class LaeproxyHandler(webapp.RequestHandler):
             rest = ''
         host = unquote(parts[0])
         if not host:
-            logger.debug('No host specified, sending 404')
+            logger.debug('No host specified: %s' % path)
+            self.response.headers[H_LAEPROXY] = 'Missing host'
             self.abort(404)
         if req.host.lower() == host.lower():
-            logger.info('Ignoring recursive request %s' % req.url)
-            self.response.headers[EIGEN_HEADER_KEY] = IGNORED_RECURSIVE
+            logger.info('Ignoring recursive request: %s' % req.url)
+            self.response.headers[H_LAEPROXY] = IGNORED_RECURSIVE
             self.abort(404)
         url = scheme + '://' + host + '/' + rest
         logger.debug('Target url: %s' % url)
@@ -172,7 +171,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             payload = req.body if payloadmethod else None
             payloadlen = len(payload) if payload else 0
             if payloadlen >= URLFETCH_REQ_MAXBYTES:
-                resheaders[EIGEN_HEADER_KEY] = REQ_TOO_LARGE
+                resheaders[H_LAEPROXY] = REQ_TOO_LARGE
                 self.abort(503)
 
             # strip hop-by-hop headers
@@ -190,27 +189,29 @@ class LaeproxyHandler(webapp.RequestHandler):
             if rangemethod:
                 if not req.range:
                     logger.debug('No upstream range header')
+                    resheaders[H_LAEPROXY] = 'Missing range header'
                     self.abort(400)
                 ranges = req.range.ranges # removed in webob 1.2b1 (http://docs.webob.org/en/latest/news.html) but app engine python 2.7 runtime uses webob 1.1.1
                 if len(ranges) != 1:
-                    logger.debug('Expected a single range header')
+                    logger.debug('Multiple ranges requested')
+                    resheaders[H_LAEPROXY] = 'Multiple ranges unsupported'
                     self.abort(400)
                 range_start, range_end = ranges[0]
                 if range_end is None:
                     logger.debug('Expected range header of the form bytes=x-y')
+                    resheaders[H_LAEPROXY] = 'Range must be of the form bytes=x-y'
                     self.abort(400)
                 range_end -= 1 # webob uses uninclusive end
                 assert range_start is not None, 'Expected range header of the form bytes=x-y'
                 if not (0 <= range_start <= range_end):
-                    logger.debug('Expected 0 <= range_start <= range_end')
-                    self.abort(400)
+                    logger.debug('Range must satisfy 0 <= range_start <= range_end')
+                    resheaders[H_LAEPROXY] = 'Range must satisfy 0 <= range_start <= range_end'
+                    self.abort(416)
                 nbytes_requested = range_end - range_start + 1
                 if nbytes_requested > RANGE_REQ_SIZE:
-                    logger.warn('Upstream request requested %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE))
+                    logger.warn('Range specifies %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE))
+                    resheaders[H_LAEPROXY] = 'Range specifies %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE)
                     self.abort(503)
-
-            # XXX http://code.google.com/p/googleappengine/issues/detail?id=739
-            # reqheaders.update(cache_control='no-cache,max-age=0', pragma='no-cache')
 
             try:
                 fetched = fetch(url,
@@ -222,27 +223,28 @@ class LaeproxyHandler(webapp.RequestHandler):
                     deadline=URLFETCH_REQ_MAXSECS,
                     validate_certificate=True,
                     )
-                resheaders[EIGEN_HEADER_KEY] = RETRIEVED_FROM_NET % now()
+                resheaders[H_LAEPROXY] = RETRIEVED_FROM_NET % now()
             except InvalidURLError:
                 logger.debug('InvalidURLError: %s' % url)
+                resheaders[H_LAEPROXY] = 'Invalid url'
                 self.abort(404)
             except DownloadError:
                 logger.warn(MISSED_DEADLINE_URLFETCH)
-                resheaders[EIGEN_HEADER_KEY] = MISSED_DEADLINE_URLFETCH
+                resheaders[H_LAEPROXY] = MISSED_DEADLINE_URLFETCH
                 self.abort(504)
             except OverQuotaError:
                 logger.warn(EXCEEDED_URLFETCH_QUOTA)
-                res.headers[EIGEN_HEADER_KEY] = EXCEEDED_URLFETCH_QUOTA
+                res.headers[H_LAEPROXY] = EXCEEDED_URLFETCH_QUOTA
                 self.abort(503)
             except Exception, e:
                 logger.error('Unexpected error: %r' % e)
                 logger.debug(format_exc())
-                resheaders[EIGEN_HEADER_KEY] = UNEXPECTED_ERROR % e
+                resheaders[H_LAEPROXY] = UNEXPECTED_ERROR % e
                 self.abort(500)
 
             status = fetched.status_code
             res.set_status(status)
-            resheaders[UPSTREAM_STATUS_CODE] = str(status)
+            resheaders[H_UPSTREAM_STATUS_CODE] = str(status)
 
             fheaders = fetched.headers
             logger.debug('urlfetch response headers: %r' % fheaders)
@@ -258,7 +260,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             trunc = fetched.content_was_truncated
             if trunc:
                 logger.warn('urlfetch returned truncated response, returning as-is, originator should verify')
-                resheaders[TRUNC_HEADER_KEY] = 'true'
+                resheaders[H_TRUNCATED] = 'true'
                 return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
             if not rangemethod:
@@ -276,7 +278,7 @@ class LaeproxyHandler(webapp.RequestHandler):
 
             if status == 206:
                 crange = fheaders.get('content-range', '')
-                resheaders[UPSTREAM_CONTENT_RANGE] = crange
+                resheaders[H_UPSTREAM_CONTENT_RANGE] = crange
                 logger.debug('Upstream Content-Range: %s' % crange)
                 try:
                     assert crange.startswith('bytes '), 'Content-Range only supported in bytes'
@@ -311,7 +313,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                 return handler(self, *args, **kw)
             except DeadlineExceededError:
                 res = self.response
-                res.headers[EIGEN_HEADER_KEY] = MISSED_DEADLINE_GAE
+                res.headers[H_LAEPROXY] = res.headers.get(H_LAEPROXY, '') + MISSED_DEADLINE_GAE
                 self.abort(503)
         wrapper.func_name = handler.func_name
         return wrapper
