@@ -82,8 +82,7 @@ RANGE_REQ_SIZE = 2000000 # bytes. matches Lantern's CHUNK_SIZE.
 
 # stamp our responses with this header
 EIGEN_HEADER_KEY = 'X-laeproxy'
-# indicates whether upstream server gave back 206
-UPSTREAM_206 = 'X-laeproxy-upstream-206'
+UPSTREAM_STATUS_CODE = 'X-laeproxy-upstream-status-code'
 # indicates truncated response
 TRUNC_HEADER_KEY = 'X-laeproxy-truncated'
 # specifies full length of an entity that has been truncated
@@ -241,6 +240,10 @@ class LaeproxyHandler(webapp.RequestHandler):
                 resheaders[EIGEN_HEADER_KEY] = UNEXPECTED_ERROR % e
                 self.abort(500)
 
+            status = fetched.status_code
+            res.set_status(status)
+            resheaders[UPSTREAM_STATUS_CODE] = str(status)
+
             fheaders = fetched.headers
             logger.debug('urlfetch response headers: %r' % fheaders)
 
@@ -249,15 +252,13 @@ class LaeproxyHandler(webapp.RequestHandler):
                 fheaders.get('connection', '').lower().split(',') if i.strip()) \
                 | HOPBYHOP
 
-            status = fetched.status_code
-            res.set_status(status)
             content = fetched.content
             contentlen = len(content)
 
             trunc = fetched.content_was_truncated
             if trunc:
                 logger.warn('urlfetch returned truncated response, returning as-is, originator should verify')
-                resheaders[TRUNC_HEADER_KEY] = 'True'
+                resheaders[TRUNC_HEADER_KEY] = 'true'
                 return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
             if not rangemethod:
@@ -271,11 +272,9 @@ class LaeproxyHandler(webapp.RequestHandler):
                 # case. Disregarding for the sake of simplicity in the face of
                 # App Engine's peculiar environment.
                 logger.debug('Destination server does not support range requests, returning response as-is')
-                resheaders[UPSTREAM_206] = 'False'
                 return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
             if status == 206:
-                resheaders[UPSTREAM_206] = 'True'
                 crange = fheaders.get('content-range', '')
                 resheaders[UPSTREAM_CONTENT_RANGE] = crange
                 logger.debug('Upstream Content-Range: %s' % crange)
