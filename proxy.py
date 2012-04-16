@@ -83,6 +83,7 @@ RANGE_REQ_SIZE = 2000000 # bytes. matches Lantern's CHUNK_SIZE.
 # stamp our responses with this header
 H_LAEPROXY = 'X-laeproxy'
 H_TRUNCATED = 'X-laeproxy-truncated'
+H_UPSTREAM_SERVER = 'X-laeproxy-upstream-server'
 H_UPSTREAM_STATUS_CODE = 'X-laeproxy-upstream-status-code'
 H_UPSTREAM_CONTENT_RANGE = 'X-laeproxy-upstream-content-range'
 # various values corresponding to possible results of proxy requests
@@ -245,8 +246,10 @@ class LaeproxyHandler(webapp.RequestHandler):
             status = fetched.status_code
             res.set_status(status)
             resheaders[H_UPSTREAM_STATUS_CODE] = str(status)
+            logger.debug('urlfetch response status: %d' % status)
 
             fheaders = fetched.headers
+            resheaders[H_UPSTREAM_SERVER] = fheaders.get('server', '')
             logger.debug('urlfetch response headers: %r' % fheaders)
 
             # strip hop-by-hop headers
