@@ -183,7 +183,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             ignored = []
             for i in ignoreheaders:
                 if i in reqheaders:
-                    ignored.append(reqheaders.pop(i))
+                    ignored.append((i, reqheaders.pop(i)))
             if ignored:
                 logger.debug('Stripped request headers: %r' % ignored)
 
