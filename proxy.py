@@ -66,50 +66,7 @@ logger.setLevel(logging.DEBUG)
 PROD = environ.get('SERVER_SOFTWARE', '').startswith('Google App Engine')
 DEV = not PROD
 
-METHODS = frozenset(('delete', 'get', 'head', 'put', 'post'))
-RANGE_METHODS = frozenset(('get',))
-PAYLOAD_METHODS = frozenset(('put', 'post'))
-
-# http://code.google.com/appengine/docs/python/urlfetch/overview.html#Quotas_and_Limits
-URLFETCH_REQ_MAXBYTES = 1024 * 1024 * 5 # 5MB
-URLFETCH_RES_MAXBYTES = 1024 * 1024 * 32
-# http://code.google.com/appengine/docs/python/urlfetch/fetchfunction.html
-URLFETCH_REQ_MAXSECS = 60
-# http://code.google.com/appengine/docs/python/runtime.html#Quotas_and_Limits
-GAE_REQ_MAXBYTES = 1024 * 1024 * 32
-GAE_RES_MAXBYTES = 1024 * 1024 * 32
-GAE_REQ_MAXSECS = 60
-
-RANGE_REQ_SIZE = 2000000 # bytes. matches Lantern's CHUNK_SIZE.
-
-H_LAEPROXY_VER = 'X-laeproxy-version' # stamp responses with our version number
-# absence of the following 2 headers means we responded before forwarding the request
-H_UPSTREAM_SERVER = 'X-laeproxy-upstream-server'
-H_UPSTREAM_STATUS_CODE = 'X-laeproxy-upstream-status-code'
-H_UPSTREAM_CONTENT_RANGE = 'X-laeproxy-upstream-content-range' # if 206
-H_TRUNCATED = 'X-laeproxy-truncated' # indicates urlfetch truncated response
-
-H_LAEPROXY_RESULT = 'X-laeproxy-result' # possible results:
-RETRIEVED_FROM_NET = 'Retrieved from network %s'
-IGNORED_RECURSIVE = 'Ignored recursive request'
-REQ_TOO_LARGE = 'Request size exceeds urlfetch limit'
-MISSED_DEADLINE_URLFETCH = 'Missed urlfetch deadline'
-MISSED_DEADLINE_GAE = ' Missed GAE deadline'
-EXCEEDED_URLFETCH_QUOTA = 'Exceeded urlfetch quota'
-UNEXPECTED_ERROR = 'Unexpected error: %r'
-
-# remove hop-by-hop headers
-# http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
-HOPBYHOP = frozenset((
-    'connection',
-    'keep-alive',
-    'proxy-authenticate',
-    'proxy-authorization',
-    'te',
-    'trailer',
-    'transfer-encoding',
-    'upgrade',
-    ))
+from constants import *
 
 def copy_headers(from_, to, ignore=set()):
     ignored = []
@@ -174,7 +131,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             payloadlen = len(payload) if payload else 0
             if payloadlen >= URLFETCH_REQ_MAXBYTES:
                 resheaders[H_LAEPROXY_RESULT] = REQ_TOO_LARGE
-                return self.error(503)
+                return self.error(400)
 
             # strip hop-by-hop headers
             ignoreheaders = set(i.strip() for i in
@@ -213,7 +170,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                 if nbytes_requested > RANGE_REQ_SIZE:
                     logger.warn('Range specifies %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE))
                     resheaders[H_LAEPROXY_RESULT] = 'Range specifies %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE)
-                    return self.error(503)
+                    return self.error(400)
 
             try:
                 fetched = fetch(url,
@@ -318,7 +275,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                 return handler(self, *args, **kw)
             except DeadlineExceededError:
                 resheaders[H_LAEPROXY_RESULT] = resheaders.get(H_LAEPROXY_RESULT, '') + MISSED_DEADLINE_GAE
-                return self.error(503)
+                return self.error(504)
             finally:
                 resheaders[H_LAEPROXY_VER] = __version__
         wrapper.func_name = handler.func_name
