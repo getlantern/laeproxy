@@ -41,6 +41,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+__version__ = '0.7.0' # http://semver.org/
+
 from datetime import datetime
 from os import environ
 from traceback import format_exc
@@ -80,13 +82,14 @@ GAE_REQ_MAXSECS = 60
 
 RANGE_REQ_SIZE = 2000000 # bytes. matches Lantern's CHUNK_SIZE.
 
-# stamp our responses with this header
-H_LAEPROXY = 'X-laeproxy'
-H_TRUNCATED = 'X-laeproxy-truncated'
+H_LAEPROXY_VER = 'X-laeproxy-version' # stamp responses with our version number
+# absence of the following 2 headers means we responded before forwarding the request
 H_UPSTREAM_SERVER = 'X-laeproxy-upstream-server'
 H_UPSTREAM_STATUS_CODE = 'X-laeproxy-upstream-status-code'
-H_UPSTREAM_CONTENT_RANGE = 'X-laeproxy-upstream-content-range'
-# various values corresponding to possible results of proxy requests
+H_UPSTREAM_CONTENT_RANGE = 'X-laeproxy-upstream-content-range' # if 206
+H_TRUNCATED = 'X-laeproxy-truncated' # indicates urlfetch truncated response
+
+H_LAEPROXY_RESULT = 'X-laeproxy-result' # possible results:
 RETRIEVED_FROM_NET = 'Retrieved from network %s'
 IGNORED_RECURSIVE = 'Ignored recursive request'
 REQ_TOO_LARGE = 'Request size exceeds urlfetch limit'
@@ -127,8 +130,8 @@ class LaeproxyHandler(webapp.RequestHandler):
             parts = rest.split('/', 1)
         except ValueError:
             logger.debug('Invalid url: %s' % path)
-            self.response.headers[H_LAEPROXY] = 'Invalid url'
-            self.abort(404)
+            self.response.headers[H_LAEPROXY_RESULT] = 'Invalid url'
+            return self.error(404)
         try:
             rest = parts[1]
         except IndexError:
@@ -136,24 +139,22 @@ class LaeproxyHandler(webapp.RequestHandler):
         host = unquote(parts[0])
         if not host:
             logger.debug('No host specified: %s' % path)
-            self.response.headers[H_LAEPROXY] = 'Missing host'
-            self.abort(404)
+            self.response.headers[H_LAEPROXY_RESULT] = 'Missing host'
+            return self.error(404)
         if req.host.lower() == host.lower():
             logger.info('Ignoring recursive request: %s' % req.url)
-            self.response.headers[H_LAEPROXY] = IGNORED_RECURSIVE
-            self.abort(404)
+            self.response.headers[H_LAEPROXY_RESULT] = IGNORED_RECURSIVE
+            return self.error(404)
         url = scheme + '://' + host + '/' + rest
         logger.debug('Target url: %s' % url)
         return url
 
-    def _send_response(self, fheaders, resheaders, ignoreheaders, content, error=None):
+    def _send_response(self, fheaders, resheaders, ignoreheaders, content):
         ignored = copy_headers(fheaders, resheaders, ignoreheaders)
         if ignored:
             logger.debug('Stripped response headers: %r' % ignored)
         logger.debug('final response headers: %r' % resheaders)
         self.response.out.write(content)
-        if error:
-            self.abort(error)
 
     def make_handler(method):
         assert method in METHODS, 'unsupported method: %s' % method
@@ -172,8 +173,8 @@ class LaeproxyHandler(webapp.RequestHandler):
             payload = req.body if payloadmethod else None
             payloadlen = len(payload) if payload else 0
             if payloadlen >= URLFETCH_REQ_MAXBYTES:
-                resheaders[H_LAEPROXY] = REQ_TOO_LARGE
-                self.abort(503)
+                resheaders[H_LAEPROXY_RESULT] = REQ_TOO_LARGE
+                return self.error(503)
 
             # strip hop-by-hop headers
             ignoreheaders = set(i.strip() for i in
@@ -190,29 +191,29 @@ class LaeproxyHandler(webapp.RequestHandler):
             if rangemethod:
                 if not req.range:
                     logger.debug('No upstream range header')
-                    resheaders[H_LAEPROXY] = 'Missing range header'
-                    self.abort(400)
+                    resheaders[H_LAEPROXY_RESULT] = 'Missing range header'
+                    return self.error(400)
                 ranges = req.range.ranges # removed in webob 1.2b1 (http://docs.webob.org/en/latest/news.html) but app engine python 2.7 runtime uses webob 1.1.1
                 if len(ranges) != 1:
                     logger.debug('Multiple ranges requested')
-                    resheaders[H_LAEPROXY] = 'Multiple ranges unsupported'
-                    self.abort(400)
+                    resheaders[H_LAEPROXY_RESULT] = 'Multiple ranges unsupported'
+                    return self.error(400)
                 range_start, range_end = ranges[0]
                 if range_end is None:
                     logger.debug('Expected range header of the form bytes=x-y')
-                    resheaders[H_LAEPROXY] = 'Range must be of the form bytes=x-y'
-                    self.abort(400)
-                range_end -= 1 # webob uses uninclusive end
+                    resheaders[H_LAEPROXY_RESULT] = 'Range must be of the form bytes=x-y'
+                    return self.error(400)
+                range_end -= 1 # webob uses uninclusive end, we use inclusive
                 assert range_start is not None, 'Expected range header of the form bytes=x-y'
                 if not (0 <= range_start <= range_end):
                     logger.debug('Range must satisfy 0 <= range_start <= range_end')
-                    resheaders[H_LAEPROXY] = 'Range must satisfy 0 <= range_start <= range_end'
-                    self.abort(416)
+                    resheaders[H_LAEPROXY_RESULT] = 'Range must satisfy 0 <= range_start <= range_end'
+                    return self.error(416)
                 nbytes_requested = range_end - range_start + 1
                 if nbytes_requested > RANGE_REQ_SIZE:
                     logger.warn('Range specifies %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE))
-                    resheaders[H_LAEPROXY] = 'Range specifies %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE)
-                    self.abort(503)
+                    resheaders[H_LAEPROXY_RESULT] = 'Range specifies %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE)
+                    return self.error(503)
 
             try:
                 fetched = fetch(url,
@@ -224,24 +225,24 @@ class LaeproxyHandler(webapp.RequestHandler):
                     deadline=URLFETCH_REQ_MAXSECS,
                     validate_certificate=True,
                     )
-                resheaders[H_LAEPROXY] = RETRIEVED_FROM_NET % now()
+                resheaders[H_LAEPROXY_RESULT] = RETRIEVED_FROM_NET % now()
             except InvalidURLError:
                 logger.debug('InvalidURLError: %s' % url)
-                resheaders[H_LAEPROXY] = 'Invalid url'
-                self.abort(404)
+                resheaders[H_LAEPROXY_RESULT] = 'Invalid url'
+                return self.error(404)
             except DownloadError:
                 logger.warn(MISSED_DEADLINE_URLFETCH)
-                resheaders[H_LAEPROXY] = MISSED_DEADLINE_URLFETCH
-                self.abort(504)
+                resheaders[H_LAEPROXY_RESULT] = MISSED_DEADLINE_URLFETCH
+                return self.error(504)
             except OverQuotaError:
                 logger.warn(EXCEEDED_URLFETCH_QUOTA)
-                res.headers[H_LAEPROXY] = EXCEEDED_URLFETCH_QUOTA
-                self.abort(503)
+                resheaders[H_LAEPROXY_RESULT] = EXCEEDED_URLFETCH_QUOTA
+                return self.error(503)
             except Exception, e:
                 logger.error('Unexpected error: %r' % e)
                 logger.debug(format_exc())
-                resheaders[H_LAEPROXY] = UNEXPECTED_ERROR % e
-                self.abort(500)
+                resheaders[H_LAEPROXY_RESULT] = UNEXPECTED_ERROR % e
+                return self.error(500)
 
             status = fetched.status_code
             res.set_status(status)
@@ -274,7 +275,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                 # Last paragraph (re proxies) of
                 # http://tools.ietf.org/html/rfc2616#section-14.35.2
                 # says we SHOULD send back 206 and cache entire entity in this
-                # case. Disregarding for the sake of simplicity in the face of
+                # case. Disregarding for the sake of simplicity because of
                 # App Engine's peculiar environment.
                 logger.debug('Destination server does not support range requests, returning response as-is')
                 return self._send_response(fheaders, resheaders, ignoreheaders, content)
@@ -312,12 +313,14 @@ class LaeproxyHandler(webapp.RequestHandler):
 
     def catch_deadline_exceeded(handler):
         def wrapper(self, *args, **kw):
+            resheaders = self.response.headers
             try:
                 return handler(self, *args, **kw)
             except DeadlineExceededError:
-                res = self.response
-                res.headers[H_LAEPROXY] = res.headers.get(H_LAEPROXY, '') + MISSED_DEADLINE_GAE
-                self.abort(503)
+                resheaders[H_LAEPROXY_RESULT] = resheaders.get(H_LAEPROXY_RESULT, '') + MISSED_DEADLINE_GAE
+                return self.error(503)
+            finally:
+                resheaders[H_LAEPROXY_VER] = __version__
         wrapper.func_name = handler.func_name
         return wrapper
 
