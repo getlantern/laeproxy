@@ -148,7 +148,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             if rangemethod:
                 if not req.range:
                     logger.debug('No upstream range header')
-                    resheaders[H_LAEPROXY_RESULT] = 'Missing range header'
+                    resheaders[H_LAEPROXY_RESULT] = 'Missing or invalid range header'
                     return self.error(400)
                 ranges = req.range.ranges # removed in webob 1.2b1 (http://docs.webob.org/en/latest/news.html) but app engine python 2.7 runtime uses webob 1.1.1
                 if len(ranges) != 1:

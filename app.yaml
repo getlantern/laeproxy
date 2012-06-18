@@ -6,5 +6,5 @@ api_version: 1
 
 handlers:
 - url: /http(s)?/.*
-  script: proxy.app
+  script: laeproxy.app
   secure: always
