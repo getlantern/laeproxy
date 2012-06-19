@@ -12,7 +12,7 @@ GAE_REQ_MAXBYTES = 1024 * 1024 * 32
 GAE_RES_MAXBYTES = 1024 * 1024 * 32
 GAE_REQ_MAXSECS = 60
 
-RANGE_REQ_SIZE = 2000000 # bytes. matches Lantern's CHUNK_SIZE.
+RANGE_REQ_SIZE = 2000000 # bytes. corresponds to Lantern's CHUNK_SIZE.
 
 H_LAEPROXY_VER = 'X-laeproxy-version' # stamp responses with our version number
 # absence of the following 2 headers means we responded before forwarding the request
