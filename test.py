@@ -1,6 +1,7 @@
 #!/usr/bin/env python2.7
 
 from constants import *
+from functools import partial
 from gaedriver import load_config_from_file, setup_app, teardown_app
 from multiprocessing import Process
 from requests import get
@@ -17,6 +18,15 @@ mockserver_proc = None
 # whether to include tests requiring a remote server
 TEST_REMOTE = True # allow passing this from command line or via config
 
+get = partial(get, allow_redirects=False)
+get_with_range = partial(get, headers={'range': 'bytes=0-300'})
+
+# XXX monkey patch webob.Response to not automatically make relative
+# uris in location headers absolute
+if not hasattr(Response, '_abs_headerlist__monkey'):
+    Response._abs_headerlist__monkey = lambda self, environ: self.headerlist
+    Response._abs_headerlist__orig = Response._abs_headerlist
+    Response._abs_headerlist = Response._abs_headerlist__monkey
 
 class MockServer(object):
     '''
@@ -61,6 +71,10 @@ class MockServer(object):
         Creates a response body matching the value of the 'msg' parameter.
         '''
         res.text = unicode(msg)
+
+    def _handle_redirect(self, req, res, location, status=302):
+        res.status_int = status
+        res.location = location
 
     def _handle_size(self, req, res, size=URLFETCH_RES_MAXBYTES, ignore_range=False):
         '''
@@ -159,13 +173,42 @@ class LaeproxyTest(TestCase):
         self.assertIn(H_TRUNCATED, res.headers)
         self.assertEquals(res.headers[H_UPSTREAM_STATUS_CODE], '200')
 
+    def test_invalid_relative_location_header(self):
+        '''
+        If destination server sends a Location header with a relative uri,
+        Google Frontend will add laeproxy's address to make it an absolute but
+        now broken uri. Laeproxy should correct the Location header before GFE
+        has a chance to.
+        '''
+        res = self._make_mockserver_req('redirect', location='/relative')
+        loc = res.headers['location']
+        self.assertFalse(loc.startswith('http://' + self.config.app_hostname))
+        self.assertTrue(loc.startswith('http://localhost:%d' % MOCKSERVER_PORT))
+
     if TEST_REMOTE:
         def test_google_humanstxt(self):
             url_direct = 'http://www.google.com/humans.txt'
             url_proxied = 'http://%s/http/www.google.com/humans.txt' % self.config.app_hostname
-            res_direct = get(url_direct, headers={'range': 'bytes=0-300'})
-            res_proxied = get(url_proxied, headers={'range': 'bytes=0-300'})
+            res_direct = get_with_range(url_direct)
+            res_proxied = get_with_range(url_proxied)
             self.assertEquals(res_direct.text, res_proxied.text)
+
+        def test_dailymotion_invalid_relative_location_header(self):
+            '''
+            If destination server sends a Location header with a relative uri,
+            Google Frontend will add laeproxy's address to make it an absolute but
+            now broken uri. Laeproxy should correct the Location header before GFE
+            has a chance to.
+            '''
+            url_direct = 'http://www.dailymotion.com'
+            res_direct = get_with_range(url_direct)
+            # assert site gave a location header with a relative uri
+            self.assertFalse(res_direct.headers['location'].startswith('http'))
+            url_proxied = 'http://%s/http/www.dailymotion.com' % self.config.app_hostname
+            res_proxied = get_with_range(url_proxied)
+            # assert laeproxy adjusted location header to match site's address
+            self.assertTrue(res_proxied.headers['location'].startswith('http://www.dailymotion.com'))
+
 
 
 def start_server():

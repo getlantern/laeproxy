@@ -104,7 +104,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             return self.error(404)
         url = scheme + '://' + host + '/' + rest
         logger.debug('Target url: %s' % url)
-        return url
+        return url, scheme, host
 
     def _send_response(self, fheaders, resheaders, ignoreheaders, content):
         ignored = copy_headers(fheaders, resheaders, ignoreheaders)
@@ -124,7 +124,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             reqheaders = req.headers
             resheaders = res.headers
 
-            url = self._extract_url(req)
+            url, scheme, host = self._extract_url(req)
 
             # check payload
             payload = req.body if payloadmethod else None
@@ -214,6 +214,13 @@ class LaeproxyHandler(webapp.RequestHandler):
             ignoreheaders = set(i.strip() for i in
                 fheaders.get('connection', '').lower().split(',') if i.strip()) \
                 | HOPBYHOP
+
+            # correct invalid relative Location header (#14)
+            loc = fheaders.get('location', '')
+            if loc and not loc.startswith('http'):
+                absloc = scheme + '://' + host + loc
+                logger.warn('Detected relative Location header, adjusting: %s -> %s' % (loc, absloc))
+                fheaders['location'] = absloc
 
             content = fetched.content
             contentlen = len(content)
