@@ -41,7 +41,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = '0.7.0' # http://semver.org/
+__version__ = '0.7.1' # http://semver.org/
 
 from datetime import datetime
 from os import environ
