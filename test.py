@@ -128,7 +128,7 @@ class LaeproxyTest(TestCase):
     def test_echo(self):
         msg = 'hello'
         res = self._make_mockserver_req('echo', msg=msg)
-        self.assertEquals(res.text, msg)
+        self.assertEqual(res.text, msg)
 
     def test_unsatisfiable_ranges_rejected(self):
         '''
@@ -146,7 +146,7 @@ class LaeproxyTest(TestCase):
             )
         for i in UNSATISFIABLE_RANGES:
             res = self._make_mockserver_req('echo', headers={'range': i})
-            self.assertEquals(res.status_code, 400)
+            self.assertEqual(res.status_code, 400)
             # laeproxy never even forwarded the request
             self.assertNotIn(H_UPSTREAM_STATUS_CODE, res.headers)
 
@@ -157,8 +157,8 @@ class LaeproxyTest(TestCase):
         '''
         size = RANGE_REQ_SIZE
         res = self._make_mockserver_req('size', size=size)
-        self.assertEquals(len(res.text), size)
-        self.assertEquals(res.status_code, 206)
+        self.assertEqual(len(res.text), size)
+        self.assertEqual(res.status_code, 206)
 
     def test_range_ignoring_server(self):
         '''
@@ -168,10 +168,10 @@ class LaeproxyTest(TestCase):
         '''
         res = self._make_mockserver_req('size', size=URLFETCH_RES_MAXBYTES + 1,
             ignore_range=True, headers={'range': 'bytes=0-%d' % (RANGE_REQ_SIZE-1)})
-        self.assertEquals(res.status_code, 200)
-        self.assertEquals(len(res.text), URLFETCH_RES_MAXBYTES)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.text), URLFETCH_RES_MAXBYTES)
         self.assertIn(H_TRUNCATED, res.headers)
-        self.assertEquals(res.headers[H_UPSTREAM_STATUS_CODE], '200')
+        self.assertEqual(res.headers[H_UPSTREAM_STATUS_CODE], '200')
 
     def test_invalid_relative_location_header(self):
         '''
@@ -191,7 +191,7 @@ class LaeproxyTest(TestCase):
             url_proxied = 'http://%s/http/www.google.com/humans.txt' % self.config.app_hostname
             res_direct = get_with_range(url_direct)
             res_proxied = get_with_range(url_proxied)
-            self.assertEquals(res_direct.text, res_proxied.text)
+            self.assertEqual(res_direct.text, res_proxied.text)
 
         def test_dailymotion_invalid_relative_location_header(self):
             '''
