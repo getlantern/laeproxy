@@ -211,8 +211,8 @@ class LaeproxyHandler(webapp.RequestHandler):
             logger.debug('urlfetch response headers: %r' % fheaders)
 
             # strip hop-by-hop headers
-            ignoreheaders = set(i.strip().lower() for i in
-                fheaders.header_msg.getheaders('connection') if i.strip()) \
+            ignoreheaders = set(i.strip() for i in
+                fheaders.get('connection', '').lower().split(',') if i.strip()) \
                 | HOPBYHOP
 
             # correct invalid relative Location header (#14)
