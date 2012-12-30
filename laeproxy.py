@@ -218,7 +218,8 @@ class LaeproxyHandler(webapp.RequestHandler):
             # correct invalid relative Location header (#14)
             loc = fheaders.get('location', '')
             if loc and not loc.startswith('http'):
-                absloc = scheme + '://' + host + loc
+                path = loc if loc.startswith('/') else '/' + loc
+                absloc = scheme + '://' + host + path
                 logger.debug('Detected relative Location header, adjusting: %s -> %s' % (loc, absloc))
                 fheaders['location'] = absloc
 
