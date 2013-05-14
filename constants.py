@@ -3,7 +3,7 @@ RANGE_METHODS = frozenset(('get',))
 PAYLOAD_METHODS = frozenset(('put', 'post'))
 
 # http://code.google.com/appengine/docs/python/urlfetch/overview.html#Quotas_and_Limits
-URLFETCH_REQ_MAXBYTES = 1024 * 1024 * 5 # 5MB
+URLFETCH_REQ_MAXBYTES = 1024 * 1024 * 10 # 10MB
 URLFETCH_RES_MAXBYTES = 1024 * 1024 * 32
 # http://code.google.com/appengine/docs/python/urlfetch/fetchfunction.html
 URLFETCH_REQ_MAXSECS = 60
