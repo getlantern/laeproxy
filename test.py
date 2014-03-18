@@ -6,17 +6,19 @@ from gaedriver import load_config_from_file, setup_app, teardown_app
 from multiprocessing import Process
 from requests import get
 from unittest2 import TestCase, main
-from webob import Request, Response
+from webob import Request, Response, __version__ as webob_version
 from wsgiref.simple_server import make_server
 
 TEST_CONFIG_FILE = './gaedriver.conf'
+config = load_config_from_file(TEST_CONFIG_FILE)
+
 GAEDRIVER_APP_TOKEN = None
 
 MOCKSERVER_PORT = 5678
 mockserver_proc = None
 
 # whether to include tests requiring a remote server
-TEST_REMOTE = True # allow passing this from command line or via config
+TEST_REMOTE = True # XXX allow specifying this from config
 
 get = partial(get, allow_redirects=False)
 get_with_range = partial(get, headers={'range': 'bytes=0-300'})
@@ -87,12 +89,14 @@ class MockServer(object):
         laeproxy does not accept them (tested for in
         test_unsatisfiable_ranges_rejected).
         '''
+        # XXX req.range.ranges was removed in webob 1.2b1
+        # (see http://docs.webob.org/en/latest/news.html)
+        # but app engine python 2.7 runtime uses webob 1.1.1
+        if webob_version != '1.1':
+            raise Exception('Unexpected webob version')
         size = int(size)
         if not ignore_range and req.range:
             try:
-                # XXX removed in webob 1.2b1
-                # (see http://docs.webob.org/en/latest/news.html)
-                # but app engine python 2.7 runtime uses webob 1.1.1
                 ranges = req.range.ranges
                 assert ranges
                 start, end = ranges[0][0], ranges[0][1]
@@ -114,8 +118,7 @@ class LaeproxyTest(TestCase):
         self.maxDiff = None
 
     def setUp(self):
-        self.config = load_config_from_file(TEST_CONFIG_FILE)
-        self.app_root = 'http://%s/http/localhost:%d/' % (self.config.app_hostname, MOCKSERVER_PORT)
+        self.app_root = 'http://%s/http/localhost:%d/' % (config.app_hostname, MOCKSERVER_PORT)
 
     def _make_mockserver_req(self, path, headers={}, **params):
        # always make range requests
@@ -182,13 +185,13 @@ class LaeproxyTest(TestCase):
         '''
         res = self._make_mockserver_req('redirect', location='/relative')
         loc = res.headers['location']
-        self.assertFalse(loc.startswith('http://' + self.config.app_hostname))
+        self.assertFalse(loc.startswith('http://' + config.app_hostname))
         self.assertTrue(loc.startswith('http://localhost:%d' % MOCKSERVER_PORT))
 
     if TEST_REMOTE:
         def test_google_humanstxt(self):
             url_direct = 'http://www.google.com/humans.txt'
-            url_proxied = 'http://%s/http/www.google.com/humans.txt' % self.config.app_hostname
+            url_proxied = 'http://%s/http/www.google.com/humans.txt' % config.app_hostname
             res_direct = get_with_range(url_direct)
             res_proxied = get_with_range(url_proxied)
             self.assertEqual(res_direct.text, res_proxied.text)
@@ -204,7 +207,7 @@ class LaeproxyTest(TestCase):
             res_direct = get_with_range(url_direct)
             # assert site gave a location header with a relative uri
             self.assertFalse(res_direct.headers['location'].startswith('http'))
-            url_proxied = 'http://%s/http/www.dailymotion.com' % self.config.app_hostname
+            url_proxied = 'http://%s/http/www.dailymotion.com' % config.app_hostname
             res_proxied = get_with_range(url_proxied)
             # assert laeproxy adjusted location header to match site's address
             self.assertTrue(res_proxied.headers['location'].startswith('http://www.dailymotion.com'))
@@ -217,22 +220,22 @@ def start_server():
 
 def setUpModule():
     global GAEDRIVER_APP_TOKEN, mockserver_proc
-    config = load_config_from_file(TEST_CONFIG_FILE)
     # setup_app() will either deploy the app referenced in
     # config or start it with dev_appserver. The particular action
     # depends on the cluster_hostname attribute. If it points to
     # localhost (e.g., localhost:8080), dev_appserver is used. Any other
     # value will trigger a deployment.
-    GAEDRIVER_APP_TOKEN = setup_app(config)
+    # XXX setup_app and teardown_app no longer working. broken by new dev_appserver?
+    #GAEDRIVER_APP_TOKEN = setup_app(config)
     mockserver_proc = Process(target=start_server)
     mockserver_proc.start()
 
 def tearDownModule():
-    config = load_config_from_file(TEST_CONFIG_FILE)
     # Once the tests are completed, use teardown_app() to
     # clean up. For apps started with dev_appserver, this will stop
     # the dev_appserver. For deployed apps, this is currently a NOP.
-    teardown_app(config, GAEDRIVER_APP_TOKEN)
+    # XXX setup_app and teardown_app no longer working. broken by new dev_appserver?
+    #teardown_app(config, GAEDRIVER_APP_TOKEN)
     mockserver_proc.terminate()
 
 if __name__ == '__main__':

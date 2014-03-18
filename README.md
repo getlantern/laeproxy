@@ -17,7 +17,8 @@ back to the browser.
 
 ## Getting Started
 
-Install the [App Engine Python SDK](https://developers.google.com/appengine/downloads#Google_App_Engine_SDK_for_Python).
+Install the [App Engine Python SDK](https://developers.google.com/appengine/downloads#Google_App_Engine_SDK_for_Python)
+(e.g. `brew install google-app-engine`).
 
 Clone laeproxy:
 
@@ -25,7 +26,8 @@ Clone laeproxy:
 
 Run from App Engine's development server:
 
-    dev_appserver.py laeproxy
+    cd laeproxy
+    dev_appserver.py .
 
 Make a test request:
 
@@ -44,11 +46,13 @@ Make a test request:
 
 ## Running tests
 
-Install [unittest2](http://pypi.python.org/pypi/unittest2), e.g.:
+Install the requirements for running the functional tests:
 
-    sudo pip install unittest2
+    sudo pip install unittest2 gaedriver multiprocessing webob==1.1.1
 
-And then run `unit2 discover` from inside the repository.
+Configure gaedriver.conf appropriately,
+make sure laeproxy is running locally if you're testing it in the dev\_appserver,
+and then run `unit2 discover`.
 
 
 ## Further Reading

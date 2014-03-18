@@ -62,6 +62,8 @@ InvalidURLError = urlfetch.InvalidURLError
 now = datetime.utcnow
 logger = logging.getLogger('laeproxy')
 logger.setLevel(logging.DEBUG)
+# XXX for some reason debug messages are still not getting printed
+logger.debug = logger.info
 
 PROD = environ.get('SERVER_SOFTWARE', '').startswith('Google App Engine')
 DEV = not PROD
@@ -123,6 +125,8 @@ class LaeproxyHandler(webapp.RequestHandler):
             res = self.response
             reqheaders = req.headers
             resheaders = res.headers
+
+            logger.debug('\nprocessing request:\n%s\n' % req)
 
             url, scheme, host = self._extract_url(req)
 
