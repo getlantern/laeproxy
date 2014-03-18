@@ -52,7 +52,7 @@ Install the requirements for running the functional tests:
 
 Configure gaedriver.conf appropriately,
 make sure laeproxy is running locally if you're testing it in the dev\_appserver,
-and then run `unit2 discover`.
+and then run `./test.py`.
 
 
 ## Further Reading
