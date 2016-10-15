@@ -43,8 +43,11 @@
 
 __version__ = '0.7.1' # http://semver.org/
 
+from constants import *
 from datetime import datetime
+from functools import wraps
 from os import environ
+from pprint import pformat
 from traceback import format_exc
 from urllib import unquote
 
@@ -55,29 +58,42 @@ from google.appengine.runtime.apiproxy_errors import OverQuotaError
 
 import logging
 
+logformatter = logging.Formatter(fmt='%(levelname)-8s %(asctime)s %(filename)s:%(lineno)s] %(message)s')
+loghandler = logging.StreamHandler()
+loghandler.setFormatter(logformatter)
+logger = logging.getLogger('laeproxy')
+logger.addHandler(loghandler)
+logger.setLevel(logging.DEBUG)
+
 fetch = urlfetch.fetch
 DownloadError = urlfetch.DownloadError
 InvalidURLError = urlfetch.InvalidURLError
 
 now = datetime.utcnow
-logger = logging.getLogger('laeproxy')
-logger.setLevel(logging.DEBUG)
-# XXX for some reason debug messages are still not getting printed
-logger.debug = logger.info
 
 PROD = environ.get('SERVER_SOFTWARE', '').startswith('Google App Engine')
 DEV = not PROD
 
-from constants import *
 
-def copy_headers(from_, to, ignore=set()):
+def headers_str(headers):
+    return pformat(sorted(headers.items(), key=lambda i: i[0].lower()))
+
+
+def copy_headers(frm, to, ignore):
     ignored = []
-    for k, v in from_.iteritems():
-        if k.lower() not in ignore:
+    for k, v in frm.items():
+        if ignore and k.lower() not in ignore:
             to[k] = v
         else:
             ignored.append((k, v))
     return ignored
+
+
+def conn_header_set(headers):
+    conn_header = headers.get('connection', '').lower()
+    stripped = (i.strip() for i in conn_header.split(','))
+    return frozenset(filter(None, stripped) if conn_header else ())
+
 
 class LaeproxyHandler(webapp.RequestHandler):
 
@@ -88,7 +104,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             scheme, rest = path.split('/', 1)
             parts = rest.split('/', 1)
         except ValueError:
-            logger.debug('Invalid url: %s' % path)
+            logger.debug('Invalid url: %s', path)
             self.response.headers[H_LAEPROXY_RESULT] = 'Invalid url'
             return self.error(404)
         try:
@@ -97,28 +113,27 @@ class LaeproxyHandler(webapp.RequestHandler):
             rest = ''
         host = unquote(parts[0])
         if not host:
-            logger.debug('No host specified: %s' % path)
+            logger.debug('No host specified: %s', path)
             self.response.headers[H_LAEPROXY_RESULT] = 'Missing host'
             return self.error(404)
         if req.host.lower() == host.lower():
-            logger.info('Ignoring recursive request: %s' % req.url)
+            logger.info('Ignoring recursive request: %s', req.url)
             self.response.headers[H_LAEPROXY_RESULT] = IGNORED_RECURSIVE
             return self.error(404)
         url = scheme + '://' + host + '/' + rest
-        logger.debug('Target url: %s' % url)
+        logger.debug('Target url: %s', url)
         return url, scheme, host
 
     def _send_response(self, fheaders, resheaders, ignoreheaders, content):
         ignored = copy_headers(fheaders, resheaders, ignoreheaders)
-        if ignored:
-            logger.debug('Stripped response headers: %r' % ignored)
-        logger.debug('final response headers: %r' % resheaders)
+        ignored and logger.debug('Stripped response headers: %s', ignored)
+        logger.debug('final response headers:\n%s', headers_str(resheaders))
         self.response.out.write(content)
 
-    def make_handler(method):
-        assert method in METHODS, 'unsupported method: %s' % method
-        rangemethod = method in RANGE_METHODS # if so, always send Range header
-        payloadmethod = method in PAYLOAD_METHODS
+    def make_handler(httpmethod):
+        assert httpmethod in METHODS, 'unsupported method: %s' % httpmethod
+        rangemethod = httpmethod in RANGE_METHODS # if so, always send Range header
+        payloadmethod = httpmethod in PAYLOAD_METHODS
 
         def handler(self, *args, **kw):
             req = self.request
@@ -126,7 +141,7 @@ class LaeproxyHandler(webapp.RequestHandler):
             reqheaders = req.headers
             resheaders = res.headers
 
-            logger.debug('\nprocessing request:\n%s\n' % req)
+            logger.debug('processing request:\n%s\n', req)
 
             url, scheme, host = self._extract_url(req)
 
@@ -137,17 +152,10 @@ class LaeproxyHandler(webapp.RequestHandler):
                 resheaders[H_LAEPROXY_RESULT] = REQ_TOO_LARGE
                 return self.error(400)
 
-            # strip hop-by-hop headers
-            ignoreheaders = set(i.strip() for i in
-                reqheaders.get('connection', '').lower().split(',') if i.strip()) \
-                | HOPBYHOP 
-            ignoreheaders.add('host')
-            ignored = []
-            for i in ignoreheaders:
-                if i in reqheaders:
-                    ignored.append((i, reqheaders.pop(i)))
-            if ignored:
-                logger.debug('Stripped request headers: %r' % ignored)
+            # strip headers from the request that should be ignored
+            ignoreheaders = conn_header_set(reqheaders) | IGNOREHEADERS
+            ignored = [(i, reqheaders.pop(i)) for i in ignoreheaders if i in reqheaders]
+            ignored and logger.debug('Stripped request headers: %s', ignored)
 
             if rangemethod:
                 if not req.range:
@@ -172,14 +180,14 @@ class LaeproxyHandler(webapp.RequestHandler):
                     return self.error(416)
                 nbytes_requested = range_end - range_start + 1
                 if nbytes_requested > RANGE_REQ_SIZE:
-                    logger.warn('Range specifies %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE))
+                    logger.warn('Range specifies %d bytes, limit is %d', nbytes_requested, RANGE_REQ_SIZE)
                     resheaders[H_LAEPROXY_RESULT] = 'Range specifies %d bytes, limit is %d' % (nbytes_requested, RANGE_REQ_SIZE)
                     return self.error(400)
 
             try:
                 fetched = fetch(url,
                     payload=payload,
-                    method=method,
+                    method=httpmethod,
                     headers=reqheaders,
                     allow_truncated=True,
                     follow_redirects=False,
@@ -188,7 +196,7 @@ class LaeproxyHandler(webapp.RequestHandler):
                     )
                 resheaders[H_LAEPROXY_RESULT] = RETRIEVED_FROM_NET % now()
             except InvalidURLError:
-                logger.debug('InvalidURLError: %s' % url)
+                logger.debug('InvalidURLError: %s', url)
                 resheaders[H_LAEPROXY_RESULT] = 'Invalid url'
                 return self.error(404)
             except DownloadError:
@@ -199,8 +207,8 @@ class LaeproxyHandler(webapp.RequestHandler):
                 logger.warn(EXCEEDED_URLFETCH_QUOTA)
                 resheaders[H_LAEPROXY_RESULT] = EXCEEDED_URLFETCH_QUOTA
                 return self.error(503)
-            except Exception, e:
-                logger.error('Unexpected error: %r' % e)
+            except Exception as e:
+                logger.error('Unexpected error: %s', e)
                 logger.debug(format_exc())
                 resheaders[H_LAEPROXY_RESULT] = UNEXPECTED_ERROR % e
                 return self.error(500)
@@ -208,23 +216,21 @@ class LaeproxyHandler(webapp.RequestHandler):
             status = fetched.status_code
             res.set_status(status)
             resheaders[H_UPSTREAM_STATUS_CODE] = str(status)
-            logger.debug('urlfetch response status: %d' % status)
+            logger.debug('urlfetch response status: %s', status)
 
             fheaders = fetched.headers
             resheaders[H_UPSTREAM_SERVER] = fheaders.get('server', '')
-            logger.debug('urlfetch response headers: %r' % fheaders)
+            logger.debug('urlfetch response headers:\n%s', headers_str(fheaders))
 
-            # strip hop-by-hop headers
-            ignoreheaders = set(i.strip() for i in
-                fheaders.get('connection', '').lower().split(',') if i.strip()) \
-                | HOPBYHOP
+            # headers from fetched response that should not be sent to client
+            ignoreheaders = conn_header_set(fheaders) | HOPBYHOP
 
             # correct invalid relative Location header (#14)
             loc = fheaders.get('location', '')
             if loc and not loc.startswith('http'):
                 path = loc if loc.startswith('/') else '/' + loc
                 absloc = scheme + '://' + host + path
-                logger.debug('Detected relative Location header, adjusting: %s -> %s' % (loc, absloc))
+                logger.debug('Detected relative Location header, adjusting: %s -> %s', loc, absloc)
                 fheaders['location'] = absloc
 
             content = fetched.content
@@ -252,35 +258,36 @@ class LaeproxyHandler(webapp.RequestHandler):
             if status == 206:
                 crange = fheaders.get('content-range', '')
                 resheaders[H_UPSTREAM_CONTENT_RANGE] = crange
-                logger.debug('Upstream Content-Range: %s' % crange)
+                logger.debug('Upstream Content-Range: %s', crange)
                 try:
                     assert crange.startswith('bytes '), 'Content-Range only supported in bytes'
                     sent, total = crange[6:].split('/', 1)
                     start, end = [int(i) for i in sent.split('-', 1)]
                     total = int(total)
-                except Exception, e:
-                    logger.warn('Error parsing upstream Content-Range %r: %r, returning 206 response as-is' % (crange, e))
+                except Exception as e:
+                    logger.warn('Error parsing upstream Content-Range %r: %r, returning 206 response as-is', crange, e)
                     logger.debug(format_exc())
                     return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-                logger.debug('Parsed Content-Range: %d-%d/%d' % (start, end, total))
+                logger.debug('Parsed Content-Range: %d-%d/%d', start, end, total)
                 entire = start == 0 and end == total - 1
 
                 # check if the 206 actually fulfills it
                 if start == range_start and end <= range_end: # could have requested more than there is
                     logger.debug('Upstream 206 response fulfills upstream range request, returning as-is')
                 else:
-                    logger.warn('Upstream Content-Range "%s" does not match range requested upstream "%s"' % (crange, reqheaders.get('range', '(no range?)')))
+                    logger.warn('Upstream Content-Range %r does not match range requested upstream %r', crange, reqheaders.get('range', '(no range?)'))
                     logger.warn('Returning upstream 206 response as-is, originator should verify')
                 return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
             logger.debug('Non-200 or 206 response to range request, returning response as-is')
             return self._send_response(fheaders, resheaders, ignoreheaders, content)
 
-        handler.func_name = method
+        handler.__name__ = httpmethod
         return handler
 
     def catch_deadline_exceeded(handler):
+        @wraps(handler)
         def wrapper(self, *args, **kw):
             resheaders = self.response.headers
             try:
@@ -290,7 +297,6 @@ class LaeproxyHandler(webapp.RequestHandler):
                 return self.error(504)
             finally:
                 resheaders[H_LAEPROXY_VER] = __version__
-        wrapper.func_name = handler.func_name
         return wrapper
 
     for method in METHODS:

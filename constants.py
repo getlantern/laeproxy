@@ -1,6 +1,6 @@
-METHODS = frozenset(('delete', 'get', 'head', 'put', 'post'))
-RANGE_METHODS = frozenset(('get',))
-PAYLOAD_METHODS = frozenset(('put', 'post'))
+METHODS = frozenset({'delete', 'get', 'head', 'put', 'post'})
+RANGE_METHODS = frozenset({'get'})
+PAYLOAD_METHODS = frozenset({'put', 'post'})
 
 # http://code.google.com/appengine/docs/python/urlfetch/overview.html#Quotas_and_Limits
 URLFETCH_REQ_MAXBYTES = 1024 * 1024 * 10 # 10MB
@@ -32,7 +32,7 @@ UNEXPECTED_ERROR = 'Unexpected error: %r'
 
 # remove hop-by-hop headers
 # http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
-HOPBYHOP = frozenset((
+HOPBYHOP = frozenset({
     'connection',
     'keep-alive',
     'proxy-authenticate',
@@ -41,4 +41,5 @@ HOPBYHOP = frozenset((
     'trailer',
     'transfer-encoding',
     'upgrade',
-    ))
+})
+IGNOREHEADERS = HOPBYHOP | {'host'}
